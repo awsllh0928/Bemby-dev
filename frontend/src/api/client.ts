@@ -1,0 +1,2149 @@
+import axios from "axios";
+import { ref } from "vue";
+
+export const api = axios.create({ baseURL: "/api" });
+
+// Credential for addresses the browser loads by itself (see tgClientApi.photoUrl). Renewed
+// a little before it lapses so an image never asks with an expired one.
+//
+// A ref rather than a plain variable: photoUrl() is called from a template, so an <img>
+// rendered before the ticket arrives has to be re-evaluated once it does. A bare `let` is
+// invisible to Vue and those images would stay pointed at a ticket-less address for good.
+const TICKET_REFRESH_MARGIN_MS = 60_000;
+const mediaTicket = ref("");
+let mediaTicketExpiry = 0;
+
+function readRequirePwdChangeClaim(): boolean {
+  const token = localStorage.getItem("token");
+  if (!token) return false;
+  try {
+    const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const payload = JSON.parse(atob(b64));
+    return payload.requirePasswordChange === true;
+  } catch {
+    return false;
+  }
+}
+
+// Reactive signal -- true when the active JWT has requirePasswordChange set.
+// Shared between LoginView (sets it on login) and App.vue (watches it to show the modal).
+export const requirePasswordChangeSignal = ref(readRequirePwdChangeClaim());
+
+// Attach stored token to every request
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem("token");
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+/**
+ * A 401 from one of these means "those credentials are wrong", not "your session has
+ * expired", so it belongs to the form that asked and must be left for it to display.
+ *
+ * Sending them through the redirect below reloaded the whole page on every failed sign-in,
+ * which threw away the error before it could render: to the person typing, the login screen
+ * simply refreshed itself, over and over, saying nothing about what was wrong. The same
+ * applied to a wrong current password in Settings, which logged the operator out rather
+ * than telling them they had mistyped it.
+ */
+function isCredentialCheck(url: string | undefined): boolean {
+  if (!url) return false;
+  const path = url.split("?")[0];
+  return (
+    path.endsWith("/auth/login") ||
+    path.endsWith("/auth/captcha") ||
+    path.endsWith("/auth/credentials")
+  );
+}
+
+// Redirect to login on 401; surface force-password-change on 403
+api.interceptors.response.use(
+  (r) => r,
+  (err) => {
+    if (err.response?.status === 401 && !isCredentialCheck(err.config?.url)) {
+      localStorage.removeItem("token");
+      mediaTicket.value = "";
+      mediaTicketExpiry = 0;
+      // Already on the login screen, a reload only loses whatever it was showing
+      if (window.location.pathname !== "/login") window.location.href = "/login";
+    }
+    if (
+      err.response?.status === 403 &&
+      err.response?.data?.requirePasswordChange
+    ) {
+      requirePasswordChangeSignal.value = true;
+    }
+    return Promise.reject(err);
+  },
+);
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+export type AuthStatus =
+  | "unauthenticated"
+  | "pending_code"
+  | "pending_2fa"
+  | "authenticated"
+  | "session_expired";
+
+export type TgAppClient = {
+  id: string;
+  name: string;
+  deviceModel: string;
+  systemVersion: string;
+  appVersion: string;
+  langCode: string;
+  langPack: string;
+  systemLangCode: string;
+  isDefault: boolean;
+};
+
+// ── Server-side list paging ──────────────────────────────────────────────────
+
+export type Paged<T> = {
+  items: T[];
+  total: number;
+  page: number;
+  pageSize: number;
+};
+
+export type ListParams = {
+  page: number;
+  pageSize: number;
+  search?: string;
+  sortKey?: string;
+  sortDir?: "asc" | "desc";
+};
+
+// Drops empty/undefined values so query strings stay clean
+function cleanParams(params: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""),
+  );
+}
+
+export type Account = {
+  id: number;
+  name: string;
+  phoneNumber: string;
+  apiId: number;
+  authStatus: AuthStatus;
+  proxyId: string | null;
+  disabled: boolean;
+  appClientId: string | null;
+  createdAt: string;
+  sortOrder: number;
+  tgDisplayName: string | null;
+  tgUsername: string | null;
+  notes: string | null;
+  /** Device model Telegram sees, with template variables expanded (server-computed, read-only). */
+  resolvedDeviceModel?: string | null;
+  /** Generic per-account flags bag (UI-safe; never contains the passkey secret). */
+  attributes?: Record<string, unknown>;
+  /** True when the Telegram account has any passkey (any device/origin). */
+  hasPasskey?: boolean;
+  /** True when Bemby holds a stored passkey (key + known DC) usable for login. */
+  hasBembyPasskey?: boolean;
+};
+
+export type BulkAddItemStatus =
+  | "pending"
+  | "requesting_code"
+  | "fetching_code"
+  | "submitting_code"
+  | "submitting_2fa"
+  | "waiting"
+  | "created"
+  | "skipped"
+  | "retrying"
+  | "done"
+  | "failed";
+
+export type BulkAddOptions = {
+  gapSeconds?: number;
+  namePrefix?: string;
+  nameIndexMode?: "total" | "batch";
+  namePadDigits?: number;
+  notesTemplate?: string;
+  codeFieldId?: string;
+  codeRegex?: string;
+  twoFaMode?: "api" | "fixed";
+  twoFaFieldId?: string;
+  twoFaRegex?: string;
+  twoFaFixed?: string;
+  deviceIds?: string[];
+  proxyIds?: string[];
+  apiCredentials?: { apiId: number; apiHash: string }[];
+  maxRetries?: number;
+  retryDelaySeconds?: number;
+};
+
+export type BulkAddItem = {
+  index: number;
+  phoneNumber: string;
+  apiUrl: string;
+  accountId: number | null;
+  accountName: string | null;
+  existing: boolean;
+  attempts: number;
+  status: BulkAddItemStatus;
+  message: string;
+  error: string | null;
+};
+
+export type BulkAddBatch = {
+  id: string;
+  createdAt: string;
+  running: boolean;
+  cancelled: boolean;
+  total: number;
+  items: BulkAddItem[];
+};
+
+export type BulkProfileItemStatus =
+  | "pending"
+  | "updating"
+  | "waiting"
+  | "retrying"
+  | "done"
+  | "failed";
+
+export type BulkProfileEntry = {
+  accountId: number;
+  firstName: string;
+  lastName?: string;
+  about?: string;
+};
+
+export type BulkProfileOptions = {
+  gapSeconds?: number;
+  maxRetries?: number;
+  retryDelaySeconds?: number;
+};
+
+export type BulkProfileItem = {
+  index: number;
+  accountId: number;
+  accountName: string;
+  firstName: string;
+  lastName: string;
+  about: string;
+  attempts: number;
+  status: BulkProfileItemStatus;
+  message: string;
+  error: string | null;
+};
+
+export type BulkProfileBatch = {
+  id: string;
+  createdAt: string;
+  running: boolean;
+  cancelled: boolean;
+  total: number;
+  items: BulkProfileItem[];
+};
+
+// The account's own editable Telegram profile
+export type TgOwnProfile = {
+  firstName: string;
+  lastName: string;
+  about: string;
+};
+
+export type PasswordInfo = {
+  hasPassword: boolean;
+  hasRecovery: boolean;
+  hint: string | null;
+  emailUnconfirmedPattern: string | null;
+  loginEmailPattern: string | null;
+};
+
+export type Passkey = {
+  id: string;
+  name: string;
+  date: number;
+  softwareEmojiId: string | null;
+  lastUsageDate: number | null;
+};
+
+export type PasskeySecret = {
+  telegramPasskeyId: string;
+  credentialId: string;
+  privateKeyPem: string;
+  rpId: string;
+  userHandle: string;
+  createdDate: number;
+  dcId?: number;
+  serverAddress?: string;
+  port?: number;
+};
+
+export type AccountExportItem = {
+  name: string;
+  phoneNumber: string;
+  apiId: number;
+  apiHash: string;
+  sessionString: string | null;
+  authStatus: string;
+  proxyId: string | null;
+  appClientId: string | null;
+  disabled: boolean;
+  passkey: PasskeySecret | null;
+  additionalAttributes: Record<string, unknown> | null;
+};
+
+export type AccountExportPayload = {
+  version: "1";
+  exportedAt: string;
+  accounts: AccountExportItem[];
+};
+
+export type SessionInfo = {
+  hash: string;
+  current: boolean;
+  deviceModel: string;
+  platform: string;
+  systemVersion: string;
+  appName: string;
+  appVersion: string;
+  dateCreated: number;
+  dateActive: number;
+  ip: string;
+  country: string;
+  region: string;
+};
+
+export type TgSpamStatus = {
+  spamStatus: "free" | "limited" | "blocked" | "frozen" | "unknown";
+  rawMessage: string;
+};
+
+export type TgAccountStatus = {
+  isActive: boolean;
+  isDeleted: boolean;
+  isRestricted: boolean;
+  restrictions: Array<{ platform: string; reason: string; text: string }>;
+  firstName: string;
+  lastName?: string;
+  username?: string;
+  phone?: string;
+};
+
+export type EmbywatchConfig = {
+  username: string;
+  password: string;
+  playDuration?: number;
+  userAgent?: string;
+  markWatched?: boolean;
+  verifyPlayable?: boolean;
+  realWatch?: boolean;
+  sequencePlay?: boolean;
+  library?: string;
+  proxyId?: string;
+};
+
+export type Proxy = {
+  id: string;
+  name: string;
+  url: string;
+};
+
+export type CustomAction =
+  | { type: "send_command"; content: string; maxRetries?: number }
+  | {
+      type: "send_contact_message";
+      contact: string;
+      content: string;
+      maxRetries?: number;
+    }
+  | {
+      type: "wait_reply";
+      maxWaitMs: number;
+      successContains?: string;
+      failContains?: string;
+      maxRetries?: number;
+      scope?: number;
+    }
+  | { type: "delay"; waitMs: number }
+  | {
+      type: "click_button";
+      button: string;
+      maxRetries: number;
+      maxWaitMs: number;
+      successContains?: string;
+      failContains?: string;
+      scope?: number;
+      cfChallenge?: boolean;
+    }
+  | {
+      type: "click_message_button";
+      contact: string;
+      button: string;
+      maxRetries: number;
+      maxWaitMs: number;
+      successContains?: string;
+      failContains?: string;
+      scope?: number;
+      cfChallenge?: boolean;
+    }
+  | {
+      type: "ai_multiple_btn";
+      contact?: string;
+      hint?: string;
+      gapMs: number;
+      maxRetries: number;
+      maxWaitMs: number;
+      successContains?: string;
+      failContains?: string;
+      scope?: number;
+    }
+  | {
+      type: "enter_captcha";
+      maxWaitMs: number;
+      captchaLength?: number;
+      maxRetries?: number;
+    }
+  | {
+      type: "join_group";
+      groupId: string;
+      checkMembership?: boolean;
+      verifyButton?: string;
+      verifyWaitMs?: number;
+    }
+  | {
+      /** Mini App opened at a given address rather than one found on a button. */
+      type: "open_mini_app_url";
+      url: string;
+      /** Bot that owns the app, used to sign the URL. Blank uses the job's bot. */
+      contact?: string;
+      appButtons?: string[];
+      successContains?: string;
+      failContains?: string;
+      maxRetries?: number;
+      maxWaitMs?: number;
+      proxyId?: string;
+      tryAllProxies?: boolean;
+    }
+  | {
+      /** The Mini App a bot pins beside the composer, opened without naming an address. */
+      type: "open_bot_menu_app";
+      /** Bot whose menu button to open. Blank uses the job's bot. */
+      contact?: string;
+      appButtons?: string[];
+      successContains?: string;
+      failContains?: string;
+      maxRetries?: number;
+      maxWaitMs?: number;
+      proxyId?: string;
+      tryAllProxies?: boolean;
+    }
+  | {
+      type: "open_mini_app";
+      contact?: string;
+      button?: string;
+      appButtons?: string[];
+      successContains?: string;
+      failContains?: string;
+      maxRetries?: number;
+      /** Budget for the browser part, across every proxy tried. 0/blank uses the default. */
+      maxWaitMs?: number;
+      /** Proxy the browser exits through: a proxy id, or "direct". Blank uses the job proxy. */
+      proxyId?: string;
+      /** Work through the rest of the proxy list when an exit is refused. */
+      tryAllProxies?: boolean;
+    }
+  | {
+      type: "open_url";
+      url: string;
+      steps?: WebStep[];
+      successContains?: string;
+      failContains?: string;
+      maxRetries?: number;
+      /** Budget for the browser part, across every proxy tried. 0/blank uses the default. */
+      maxWaitMs?: number;
+      /** Proxy the browser exits through: a proxy id, or "direct". Blank uses the job proxy. */
+      proxyId?: string;
+      /** Work through the rest of the proxy list when an exit is refused. */
+      tryAllProxies?: boolean;
+    }
+  | { type: "subscribe_channel"; channelId: string; checkMembership?: boolean };
+
+/** One sub-step of `open_url`, run against the loaded page. */
+export type WebStep =
+  | { type: "web_input"; selector: string; text: string }
+  | { type: "web_button"; selector: string }
+  | { type: "web_delay"; waitMs: number }
+  | { type: "web_scroll"; x?: number; y?: number }
+  | { type: "web_wait_element"; selector: string; waitMs?: number }
+  | { type: "web_turnstile" }
+  | { type: "ai_web_button"; hint?: string }
+  | { type: "ai_web_click_xy"; hint?: string }
+  | { type: "ai_web_input"; hint?: string; text?: string };
+
+/** What one `open_url` sub-step did, with the page as it looked afterwards. */
+export type WebStepLog = {
+  type: WebStep["type"];
+  label: string;
+  outcome?: string;
+  error?: string;
+  screenshot?: string;
+  aiPrompt?: string;
+  aiResponse?: string;
+};
+
+export type CustomConfig = {
+  actions: CustomAction[];
+  maxRetries?: number;
+  proxyId?: string;
+};
+
+export type CheckinConfig = {
+  successContains?: string;
+  failContains?: string;
+  proxyId?: string;
+  /** Open a Cloudflare-gated checkin URL in a browser to pass the "I am not a bot" check. */
+  cfChallenge?: boolean;
+};
+
+export type AutoregConfig = {
+  groupId: string;
+  codePrefix: string;
+  /** Matches codes with no stable prefix; capture group 1 is the code. Replaces codePrefix. */
+  codeRegex?: string;
+  /** Strip Chinese characters and punctuation out of a code before sending. */
+  stripChinese?: boolean;
+  /** Characters to strip out of a code before sending, e.g. `~*`. */
+  stripChars?: string;
+  /** Have the AI adjust each code before sending, going on the surrounding chat. */
+  aiModifyCode?: boolean;
+  aiModifyCodeHint?: string;
+  aiContextCount?: number;
+  /** Bot text meaning it is ready for a code, waited for after the register button. */
+  codeReadyContains?: string;
+  /** Bot text meaning it is ready for the username, waited for after a code is accepted. */
+  usernameReadyContains?: string;
+  registerButton?: string;
+  /** Click a button or t.me link on the bot's reply once a code is accepted. */
+  clickAfterCode?: boolean;
+  /** Text of that button or link (partial match); blank takes the sole/first one. */
+  afterCodeButton?: string;
+  /** On, a reply with no such button spends the code and the next one is tried. */
+  afterCodeRequired?: boolean;
+  signupUsername: string;
+  listenMinutes?: number;
+  scanHistoryCount?: number;
+  entryMode?: "button" | "command";
+  successContains?: string;
+  failContains?: string;
+  proxyId?: string;
+};
+
+export type CustomStepLog = {
+  step: number;
+  actionType: string;
+  label: string;
+  preClickHtml?: string;
+  preClickImage?: string;
+  preClickButtons?: string[][];
+  preClickHasMedia?: boolean;
+  clickedButton?: string;
+  responseHtml?: string;
+  responseImage?: string;
+  responseButtons?: string[][];
+  responseHasMedia?: boolean;
+  callbackAnswer?: string;
+  result?: string;
+  error?: string;
+  durationMs?: number;
+  aiPrompt?: string;
+  aiResponse?: string;
+  aiDurationMs?: number;
+  aiRetries?: string[];
+  // Dev fields
+  msgCount?: number;
+  responseSource?: "edit" | "new_message";
+  retryCount?: number;
+  errorName?: string;
+  /** 1-based job attempt number (only set when job maxRetries > 1) */
+  jobAttempt?: number;
+  /** 1-based action attempt number (only set when action maxRetries > 0) */
+  actionAttempt?: number;
+  // Browser (Cloudflare / Mini App) fields
+  cfHost?: string;
+  cfChallenged?: boolean;
+  cfPassed?: boolean;
+  cfMiniApp?: boolean;
+  cfMiniAppSigned?: boolean;
+  cfMiniAppAction?: string;
+  cfProxy?: string;
+  /** Which browser build ran the step: the licensed one, or the free fallback. */
+  cfBuild?: "keyed" | "free";
+  cfAttempts?: number;
+  cfPageTitle?: string;
+  cfNavError?: string;
+  cfTrace?: string[];
+  /** Screenshot of the page the browser ended up on. */
+  cfScreenshot?: string;
+  /** For open_url: one entry per sub-step run on the page, in order. */
+  webSteps?: WebStepLog[];
+};
+
+export type Job = {
+  id: number;
+  name: string;
+  accountId: number | null;
+  accountName?: string;
+  jobType: "checkin" | "embywatch" | "custom" | "autoreg";
+  /** checkin: Telegram bot username. embywatch: Emby server URL */
+  botUsername: string;
+  scheduleWindowStart: number;
+  scheduleWindowEnd: number;
+  timezone: string;
+  replyTimeoutMs: number;
+  retryMax: number;
+  enabled: boolean;
+  createdAt: string;
+  config: string | null;
+  startCommand: string;
+  checkinButton: string;
+  templateId?: number | null;
+  runEveryDays: number;
+  runEveryDaysMax?: number | null;
+  retired?: string | null;
+  /** ISO timestamp of the last successful run; null when it has never succeeded */
+  lastSuccessAt?: string | null;
+};
+
+export type JobTemplate = {
+  id: number;
+  name: string;
+  jobType: "checkin" | "embywatch" | "custom" | "autoreg";
+  botUsername: string;
+  timezone: string;
+  replyTimeoutMs: number;
+  retryMax: number;
+  enabled: boolean;
+  config: string | null;
+  startCommand: string;
+  checkinButton: string;
+  createdAt: string;
+  linkedJobCount?: number;
+  runEveryDays: number;
+  runEveryDaysMax?: number | null;
+};
+
+// Why Real Watch pulled no bytes, when the toggle was on.
+export type RealWatchNote = "no-stream-url" | "stream-failed";
+
+export type EmbywatchEpisode = {
+  itemType: string;
+  title: string;
+  seriesName?: string;
+  seasonNumber?: number;
+  episodeNumber?: number;
+  runtimeSeconds: number;
+  startSeconds: number;
+  endSeconds: number;
+  watchedSeconds: number;
+  markedWatched: boolean;
+  streamedBytes?: number;
+  realWatchNote?: RealWatchNote;
+  realWatchTranscoded?: boolean;
+};
+
+export type EmbywatchLog = EmbywatchEpisode & {
+  sequencePlay?: boolean;
+  episodesCompleted?: number;
+  episodes?: EmbywatchEpisode[];
+};
+
+export type CheckinAttemptLog = {
+  attempt: number;
+  commandSent: string;
+  hasMedia: boolean;
+  commandResponseHtml: string;
+  commandResponseImages?: string[];
+  availableButtons: string[][];
+  buttonClicked?: string;
+  callbackAnswer?: string;
+  buttonResponseHtml?: string;
+  buttonResponseHasMedia?: boolean;
+  buttonResponseImage?: string;
+  buttonResponseButtons?: string[][];
+  aiDurationMs?: number;
+  aiPrompt?: string;
+  aiResponse?: string;
+  aiRetries?: string[];
+  error?: string;
+  // Dev timing fields
+  connectMs?: number;
+  replyLatencyMs?: number;
+  buttonClickMs?: number;
+  buttonResponseMs?: number;
+  buttonResponseSource?: "edit" | "new_message";
+  totalMs?: number;
+  replyTimeoutMs?: number;
+  errorName?: string;
+};
+
+export type Log = {
+  id: number;
+  jobId: number;
+  jobName: string | null;
+  jobType: string | null;
+  accountName: string | null;
+  ranAt: string;
+  status: "success" | "failed" | "running";
+  message: string | null;
+  retired: boolean;
+  detail?:
+    CheckinAttemptLog[] | EmbywatchLog[] | { steps: CustomStepLog[] } | null;
+};
+
+export type ScheduleStatus = {
+  jobId: number;
+  jobName: string;
+  /** checkin | embywatch | custom | autoreg -- drives the icon and colour on the chip. */
+  jobType: string;
+  nextRun: string;
+};
+
+// ── Auth ─────────────────────────────────────────────────────────────────────
+
+export const authApi = {
+  getCaptcha: () =>
+    api
+      .get<{ svg: string; captchaToken: string }>("/auth/captcha")
+      .then((r) => r.data),
+  login: (
+    username: string,
+    password: string,
+    captchaToken: string,
+    captchaAnswer: string,
+  ) =>
+    api
+      .post<{
+        token: string;
+        requirePasswordChange?: boolean;
+      }>("/auth/login", { username, password, captchaToken, captchaAnswer })
+      .then((r) => r.data),
+  changeCredentials: (
+    currentPassword: string,
+    username?: string,
+    newPassword?: string,
+  ) =>
+    api
+      .put<{
+        message: string;
+        token?: string;
+      }>("/auth/credentials", { currentPassword, username, newPassword })
+      .then((r) => r.data),
+  // Retires every session token issued so far. The reply carries a new one for this tab,
+  // so signing everyone else out does not sign the operator out of the page they did it on.
+  revokeSessions: () =>
+    api
+      .post<{ message: string; token: string }>("/auth/revoke-sessions")
+      .then((r) => r.data),
+};
+
+// ── Accounts ─────────────────────────────────────────────────────────────────
+
+export const accountsApi = {
+  list: () => api.get<Account[]>("/accounts").then((r) => r.data),
+  listPaged: (
+    params: ListParams & { authStatus?: string; disabled?: "0" | "1" | "" },
+  ) =>
+    api
+      .get<Paged<Account>>("/accounts", { params: cleanParams(params) })
+      .then((r) => r.data),
+  create: (
+    data: Omit<
+      Account,
+      | "id"
+      | "authStatus"
+      | "createdAt"
+      | "disabled"
+      | "sortOrder"
+      | "tgDisplayName"
+      | "tgUsername"
+    > & {
+      apiHash: string;
+    },
+  ) => api.post<Account>("/accounts", data).then((r) => r.data),
+  update: (
+    id: number,
+    data: Partial<Account> & { apiHash?: string; proxyId?: string | null },
+  ) => api.put<Account>(`/accounts/${id}`, data).then((r) => r.data),
+  delete: (id: number) => api.delete(`/accounts/${id}`),
+  requestCode: (id: number) =>
+    api
+      .post<{
+        method: "passkey" | "code";
+        step?: "2fa" | "done";
+        message?: string;
+        isCodeViaApp?: boolean;
+      }>(`/accounts/${id}/auth/request`)
+      .then((r) => r.data),
+  resendCode: (id: number) =>
+    api.post(`/accounts/${id}/auth/resend`).then((r) => r.data),
+  verify: (id: number, data: { code?: string; password?: string }) =>
+    api
+      .post<{ step: string }>(`/accounts/${id}/auth/verify`, data)
+      .then((r) => r.data),
+  checkStatus: (id: number) =>
+    api
+      .post<TgAccountStatus>(`/accounts/${id}/check-status`)
+      .then((r) => r.data),
+  refreshTgMeta: (id: number) =>
+    api
+      .post<{ tgDisplayName: string | null; tgUsername: string | null }>(
+        `/accounts/${id}/refresh-tg-meta`,
+      )
+      .then((r) => r.data),
+  fetchAttributes: (id: number) =>
+    api
+      .post<{ account: Account; warnings: string[]; authExpired: boolean }>(
+        `/accounts/${id}/fetch-attributes`,
+      )
+      .then((r) => r.data),
+  getProfile: (id: number) =>
+    api.get<TgOwnProfile>(`/accounts/${id}/profile`).then((r) => r.data),
+  updateProfile: (
+    id: number,
+    data: { firstName: string; lastName?: string; about?: string },
+  ) =>
+    api
+      .post<TgOwnProfile & { tgDisplayName: string | null }>(
+        `/accounts/${id}/update-profile`,
+        data,
+      )
+      .then((r) => r.data),
+  export: (ids?: number[], secret?: string) =>
+    api
+      .post<AccountExportPayload>("/accounts/export", {
+        ids: ids ?? [],
+        secret: secret || undefined,
+      })
+      .then((r) => r.data),
+  import: (data: unknown, secret?: string, forceReauth = true) =>
+    api
+      .post<{ imported: number; skipped: number }>("/accounts/import", {
+        data,
+        secret: secret || undefined,
+        forceReauth,
+      })
+      .then((r) => r.data),
+  updateTwoFa: (
+    id: number,
+    opts: { currentPassword?: string; newPassword?: string; hint?: string },
+  ) =>
+    api
+      .post<{ success: true }>(`/accounts/${id}/update-2fa`, opts)
+      .then((r) => r.data),
+  getSessions: (id: number) =>
+    api.get<SessionInfo[]>(`/accounts/${id}/sessions`).then((r) => r.data),
+  terminateSession: (id: number, hash: string) =>
+    api
+      .post<{ success: true }>(`/accounts/${id}/terminate-session`, { hash })
+      .then((r) => r.data),
+  terminateOtherSessions: (id: number) =>
+    api
+      .post<{ success: true }>(`/accounts/${id}/terminate-other-sessions`)
+      .then((r) => r.data),
+  checkSpam: (id: number) =>
+    api.post<TgSpamStatus>(`/accounts/${id}/check-spam`).then((r) => r.data),
+  checkEnabledSessions: () =>
+    api
+      .post<{
+        checked: number;
+        expired: number[];
+      }>("/accounts/check-enabled-sessions")
+      .then((r) => r.data),
+  reorder: (items: Array<{ id: number; sortOrder: number }>) =>
+    api.put("/accounts/reorder", { items }).then((r) => r.data),
+  bulkUpdateNotes: (ids: number[], notes: string | null) =>
+    api.put("/accounts/bulk-notes", { ids, notes }).then((r) => r.data),
+  bulkRename: (items: Array<{ id: number; name: string }>) =>
+    api.put("/accounts/bulk-rename", { items }).then((r) => r.data),
+  bulkAdd: (text: string, options?: BulkAddOptions) =>
+    api
+      .post<BulkAddBatch>("/accounts/bulk-add", { text, options })
+      .then((r) => r.data),
+  bulkAddStatus: () =>
+    api
+      .get<BulkAddBatch | null>("/accounts/bulk-add/status")
+      .then((r) => r.data),
+  bulkAddCancel: () =>
+    api
+      .post<{ cancelled: boolean }>("/accounts/bulk-add/cancel")
+      .then((r) => r.data),
+  bulkProfile: (items: BulkProfileEntry[], options?: BulkProfileOptions) =>
+    api
+      .post<BulkProfileBatch>("/accounts/bulk-profile", { items, options })
+      .then((r) => r.data),
+  bulkProfileStatus: () =>
+    api
+      .get<BulkProfileBatch | null>("/accounts/bulk-profile/status")
+      .then((r) => r.data),
+  /**
+   * AI-written profiles, already cleaned to what Telegram and the bulk form accept. One
+   * request covers the whole batch; `includeAbout: false` asks for names only.
+   */
+  bulkProfileGenerate: (count: number, hint?: string, includeAbout = true) =>
+    api
+      .post<{
+        profiles: { firstName: string; lastName: string; about: string }[];
+      }>("/accounts/bulk-profile/generate", { count, hint, includeAbout })
+      .then((r) => r.data),
+  bulkProfileCancel: () =>
+    api
+      .post<{ cancelled: boolean }>("/accounts/bulk-profile/cancel")
+      .then((r) => r.data),
+  forceReauth: (id: number) =>
+    api.post<Account>(`/accounts/${id}/force-reauth`).then((r) => r.data),
+  getPasswordInfo: (id: number) =>
+    api.get<PasswordInfo>(`/accounts/${id}/password-info`).then((r) => r.data),
+  sendLoginEmailCode: (id: number, email: string) =>
+    api
+      .post<{ emailPattern: string; codeLength: number }>(
+        `/accounts/${id}/login-email/send-code`,
+        { email },
+      )
+      .then((r) => r.data),
+  verifyLoginEmail: (id: number, code: string) =>
+    api
+      .post<{ email: string | null }>(`/accounts/${id}/login-email/verify`, { code })
+      .then((r) => r.data),
+  autoLoginEmail: (id: number, gmail: string, appPassword: string, tag: string) =>
+    api
+      .post<{ email: string }>(`/accounts/${id}/login-email/auto`, {
+        gmail,
+        appPassword,
+        tag,
+      })
+      .then((r) => r.data),
+  testGmail: (gmail: string, appPassword: string) =>
+    api
+      .post<{ ok: boolean; error?: string }>("/accounts/gmail/test", {
+        gmail,
+        appPassword,
+      })
+      .then((r) => r.data),
+  getPasskeys: (id: number) =>
+    api
+      .get<{ passkeys: Passkey[]; storedIds: string[] }>(
+        `/accounts/${id}/passkeys`,
+      )
+      .then((r) => r.data),
+  deletePasskey: (id: number, passkeyId: string) =>
+    api
+      .delete<{ ok: boolean }>(
+        `/accounts/${id}/passkeys/${encodeURIComponent(passkeyId)}`,
+      )
+      .then((r) => r.data),
+  registerPasskey: (id: number, origin?: string) =>
+    api
+      .post<{ passkey: Passkey }>(`/accounts/${id}/passkeys`, { origin })
+      .then((r) => r.data),
+  verifyPasskey: (id: number, passkeyId: string, origin?: string) =>
+    api
+      .post<{
+        ok: boolean;
+        passwordRequired: boolean;
+        userId: string;
+        firstName: string | null;
+        username: string | null;
+      }>(
+        `/accounts/${id}/passkeys/${encodeURIComponent(passkeyId)}/verify`,
+        { origin },
+      )
+      .then((r) => r.data),
+};
+
+// ── Jobs ─────────────────────────────────────────────────────────────────────
+
+export type JobFacets = {
+  botUsernames: string[];
+  templates: Array<{ id: number; name: string }>;
+};
+
+export const jobsApi = {
+  list: () => api.get<Job[]>("/jobs").then((r) => r.data),
+  listPaged: (
+    params: ListParams & {
+      jobType?: string;
+      accountId?: number | "";
+      botUsername?: string;
+      templateId?: number | "";
+      enabled?: "0" | "1" | "";
+    },
+  ) =>
+    api
+      .get<Paged<Job> & { facets: JobFacets }>("/jobs", {
+        params: cleanParams(params),
+      })
+      .then((r) => r.data),
+  create: (data: Partial<Job>) =>
+    api.post<Job>("/jobs", data).then((r) => r.data),
+  update: (id: number, data: Partial<Job>) =>
+    api.put<Job>(`/jobs/${id}`, data).then((r) => r.data),
+  delete: (id: number) => api.delete(`/jobs/${id}`),
+  run: (id: number) =>
+    api
+      .post<{ message: string; logId: number }>(`/jobs/${id}/run`)
+      .then((r) => r.data),
+  testEmby: (data: {
+    serverUrl: string;
+    username: string;
+    password: string;
+    userAgent?: string;
+    proxyId?: string;
+  }) =>
+    api
+      .post<{ ok: boolean; userName?: string; error?: string }>(
+        "/jobs/test-emby",
+        data,
+      )
+      .then((r) => r.data),
+};
+
+// ── Templates ────────────────────────────────────────────────────────────────
+
+export type AvailableAccount = {
+  id: number;
+  name: string;
+  phoneNumber: string;
+  authStatus: AuthStatus;
+  tgDisplayName: string | null;
+};
+
+export const templatesApi = {
+  list: () => api.get<JobTemplate[]>("/templates").then((r) => r.data),
+  // search is fuzzy-matched server side against template name and bot username
+  listPaged: (
+    params: ListParams & { jobType?: string; enabled?: "0" | "1" | "" },
+  ) =>
+    api
+      .get<Paged<JobTemplate>>("/templates", { params: cleanParams(params) })
+      .then((r) => r.data),
+  create: (data: Partial<JobTemplate>) =>
+    api.post<JobTemplate>("/templates", data).then((r) => r.data),
+  update: (id: number, data: Partial<JobTemplate>) =>
+    api.put<JobTemplate>(`/templates/${id}`, data).then((r) => r.data),
+  duplicate: (id: number) =>
+    api.post<JobTemplate>(`/templates/${id}/duplicate`).then((r) => r.data),
+  delete: (id: number) => api.delete(`/templates/${id}`),
+  setLinkedJobsEnabled: (id: number, enabled: boolean) =>
+    api
+      .put<{ ok: boolean }>(`/templates/${id}/jobs/enabled`, { enabled })
+      .then((r) => r.data),
+  availableAccounts: (id: number) =>
+    api
+      .get<AvailableAccount[]>(`/templates/${id}/available-accounts`)
+      .then((r) => r.data),
+  createJobs: (
+    id: number,
+    data: {
+      jobs: Array<{
+        accountId: number;
+        name: string;
+        config?: Record<string, unknown>;
+      }>;
+      scheduleWindowStart: number;
+      scheduleWindowEnd: number;
+    },
+  ) =>
+    api
+      .post<{
+        created: number;
+        ids: number[];
+      }>(`/templates/${id}/create-jobs`, data)
+      .then((r) => r.data),
+};
+
+// ── Logs ─────────────────────────────────────────────────────────────────────
+
+export const logsApi = {
+  list: (params?: {
+    jobId?: number;
+    limit?: number;
+    offset?: number;
+    showRetired?: boolean;
+  }) =>
+    api
+      .get<Log[]>("/logs", {
+        params: { ...params, showRetired: params?.showRetired ? "1" : "0" },
+      })
+      .then((r) => r.data),
+  listPaged: (params: {
+    page: number;
+    pageSize: number;
+    jobId?: number | "";
+    showRetired?: boolean;
+    status?: string;
+    search?: string;
+  }) =>
+    api
+      .get<Paged<Log>>("/logs", {
+        params: cleanParams({
+          ...params,
+          showRetired: params.showRetired ? "1" : "0",
+        }),
+      })
+      .then((r) => r.data),
+  getOne: (id: number) => api.get<Log>(`/logs/${id}`).then((r) => r.data),
+  cancel: (id: number) =>
+    api.post<{ message: string }>(`/logs/${id}/cancel`).then((r) => r.data),
+  retire: (id: number) =>
+    api.patch<{ retired: boolean }>(`/logs/${id}/retire`).then((r) => r.data),
+};
+
+// ── Status ────────────────────────────────────────────────────────────────────
+
+export type MemorySample = {
+  at: string;
+  rssMb: number;
+  externalMb: number;
+  heapUsedMb: number;
+  runs: Array<{ logId: number; jobName: string }>;
+};
+
+export type MemoryReport = {
+  limitMb: number | null;
+  current: MemorySample;
+  peak: MemorySample | null;
+  // Only set when the previous process was killed rather than stopped, which is how an
+  // OOM shows up: the process itself never gets to report it.
+  lastBeforeCrash: MemorySample | null;
+};
+
+export const statusApi = {
+  get: () => api.get<ScheduleStatus[]>("/status").then((r) => r.data),
+  /** Calls off one upcoming run; the job keeps its schedule and returns on its next day. */
+  skipRun: (jobId: number) =>
+    api
+      .post<{ ok: boolean; nextRun?: string }>(`/status/skip/${jobId}`)
+      .then((r) => r.data),
+  memory: () => api.get<MemoryReport>("/status/memory").then((r) => r.data),
+};
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+export type UAPreset = {
+  name: string;
+  value: string;
+};
+
+export type Settings = {
+  default_timezone: string;
+  default_max_retry: string;
+  check_daily_run: string;
+  default_ua: string;
+  default_play_duration: string;
+  default_device_name: string;
+  /** Server-computed: "true" when any AI supplier, legacy setting or env provides a key. */
+  ai_key_configured?: string;
+  /** Server-computed: "true" when bulk account management is enabled via the BULK_ACCOUNT_MANAGEMENT env var. */
+  bulk_account_management?: string;
+  ai_model: string;
+  /** ai_models row id pinning the default model to an exact supplier. */
+  ai_default_model_id?: string;
+  ai_fallback_enabled?: string;
+  /**
+   * Target for the account-session sender, used only when no bot token is set.
+   * @deprecated That sender is due for removal; use notify_bot_token + notify_bot_target.
+   */
+  notify_tg_username: string;
+  notify_tg_events: string;
+  /** Bot API token from BotFather. Write-only: reads come back as notify_bot_token_masked. */
+  notify_bot_token?: string;
+  /** Chat the bot notifies: a numeric chat id, or @name for a public channel. */
+  notify_bot_target?: string;
+  /** Server-computed: "true" when a notification bot token is stored. */
+  notify_bot_configured?: string;
+  /** Server-computed: the stored token as 12345678:****wXyZ. Never the raw value. */
+  notify_bot_token_masked?: string;
+  ua_presets: string;
+  proxies: string;
+  tg_app_clients: string;
+  tg_client_mode: string; // 'default' | 'random'
+  default_tg_api_id?: string;
+  /** Masked value returned by the server (e.g. abcd****efgh). Never the raw hash. */
+  default_tg_api_hash?: string;
+  /** "true" to show accounts as "{Bemby name} - {TG name}" throughout the app. */
+  account_display_with_tg_name?: string;
+  /** "true" moves the upcoming-runs list to its own menu entry. */
+  schedule_separate_page?: string;
+  /** Days to keep job logs; "0" keeps all logs. */
+  log_retention_days?: string;
+  /** Minimum minutes between scheduled runs; "0" disables staggering. */
+  schedule_min_gap_minutes?: string;
+  /** "true" once the user has enabled the on-demand Cloudflare solver. */
+  cf_solver_enabled?: string;
+  /** Server-computed: "true" when the Cloudflare-solver browser is installed. */
+  cf_chromium_installed?: string;
+  /** Server-computed: version of that browser, e.g. "Chromium 151.0.7922.34". */
+  cf_chromium_version?: string;
+  /** Server-computed: "keyed" when the installed build is the one a licence key unlocks. */
+  cf_chromium_tier?: string;
+  /** Server-computed: path of the browser a job will actually launch. */
+  cf_chromium_path?: string;
+  /** Server-computed: "true" when a key is stored but its build is not downloaded yet. */
+  cf_chromium_keyed_pending?: string;
+  /** Server-computed: "true" when the unlicensed build is on disk to fall back on. */
+  cf_chromium_free_installed?: string;
+  /** Server-computed: how many solver browsers are open right now. */
+  cf_browsers_running?: string;
+  /** Server-computed JSON: every installed build, with its tier, version and path. */
+  cf_chromium_builds?: string;
+  /** Server-computed: how many browser profiles are on disk. */
+  cf_profile_count?: string;
+  /** Locale the browser reports; blank follows the country its exit comes out in. */
+  cf_browser_lang?: string;
+  /** Server-computed: "true" when the CJK/emoji faces are in the data dir. */
+  cf_fonts_installed?: string;
+  /** Server-computed: comma-separated faces still to download. */
+  cf_fonts_missing?: string;
+  /** Server-computed JSON: stored CloakBrowser licence keys, masked. */
+  cf_cloak_keys_masked?: string;
+  /** Server-computed: how many licence keys are held by a running browser. */
+  cf_cloak_keys_in_use?: string;
+  /** JSON: the browser timings and limits in force. */
+  cf_tuning?: string;
+  /** Server-computed JSON: the values the solver ships with. */
+  cf_tuning_defaults?: string;
+  /** Server-computed JSON: `{min,max}` each timing is held to. */
+  cf_tuning_limits?: string;
+  proxy_providers_count?: string;
+};
+
+export type CfBrowserTestRun = {
+  running: boolean;
+  ok?: boolean;
+  error?: string;
+  /** One entry per installed build, appended as each finishes. */
+  builds: CfBrowserTest[];
+  message?: string;
+};
+
+export type CfBrowserTest = {
+  ok: boolean;
+  /** Which build this result is for. */
+  tier?: "keyed" | "free";
+  executable?: string;
+  version?: string;
+  renderedText?: string;
+  error?: string;
+  env?: Record<string, unknown>;
+  warnings?: string[];
+  notes?: string[];
+  exitCountry?: string;
+};
+
+export const settingsApi = {
+  get: () => api.get<Settings>("/settings").then((r) => r.data),
+  update: (data: Partial<Settings>) =>
+    api.put<Settings>("/settings", data).then((r) => r.data),
+  testProxy: (url: string) =>
+    api
+      .post<{ ok: boolean; error?: string }>("/settings/test-proxy", { url })
+      .then((r) => r.data),
+  /** `force` downloads the browser again over an existing one, i.e. updates it. */
+  installCfSolver: (force = false, tier?: "free") =>
+    api
+      .post<{
+        ok: boolean;
+        installed?: boolean;
+        version?: string;
+        output?: string;
+        message?: string;
+        fontsInstalled?: boolean;
+      }>("/settings/cf-solver/install", { force, ...(tier ? { tier } : {}) })
+      .then((r) => r.data),
+  /** Closes every solver browser that is open, failing the jobs holding them. */
+  stopCfBrowsers: () =>
+    api
+      .post<{ ok: boolean; stopped: number }>("/settings/cf-solver/stop")
+      .then((r) => r.data),
+  /** Deletes the per-exit browser profiles (cookies, cache, site data). */
+  clearCfProfiles: () =>
+    api
+      .post<{ ok: boolean; removed?: number; message?: string }>(
+        "/settings/cf-solver/clear-profiles",
+      )
+      .then((r) => r.data),
+  /** Deletes every downloaded browser build, reclaiming the space in the data dir. */
+  uninstallCfSolver: () =>
+    api
+      .post<{ ok: boolean; removed?: string[]; message?: string }>(
+        "/settings/cf-solver/uninstall",
+      )
+      .then((r) => r.data),
+  /**
+   * Starts a test of every installed build. It runs in the background -- a browser launch
+   * plus a real page load, once per build, outlives what a proxy will hold a request open
+   * for -- so this returns straight away and `cfSolverTestStatus` reports on it.
+   */
+  testCfSolver: () =>
+    api.post<CfBrowserTestRun>("/settings/cf-solver/test").then((r) => r.data),
+  /** How the run started above is going, with each build's result as it lands. */
+  cfSolverTestStatus: () =>
+    api.get<CfBrowserTestRun>("/settings/cf-solver/test").then((r) => r.data),
+  getCfKeys: () =>
+    api.get<CfKeysResponse>("/settings/cf-solver/keys").then((r) => r.data),
+  /** Send the masked value back unchanged to keep a stored key while editing its label. */
+  saveCfKeys: (keys: Array<{ label: string; key: string }>) =>
+    api.put<CfKeysResponse>("/settings/cf-solver/keys", { keys }).then((r) => r.data),
+  checkCfKeys: () =>
+    api
+      .post<{ results: CfKeyCheck[] }>("/settings/cf-solver/keys/check")
+      .then((r) => r.data.results),
+  getProxyProviders: () =>
+    api
+      .get<{ providers: ProxyProvider[] }>("/settings/proxy-providers")
+      .then((r) => r.data.providers),
+  saveProxyProviders: (providers: ProxyProvider[]) =>
+    api
+      .put<{ providers: ProxyProvider[] }>("/settings/proxy-providers", { providers })
+      .then((r) => r.data.providers),
+  syncProxyProviders: (providerId?: string) =>
+    api
+      .post<ProxySyncResult>(
+        "/settings/proxy-providers/sync",
+        providerId ? { providerId } : {},
+      )
+      .then((r) => r.data),
+  /** Who the stored notification token belongs to, so a bad token is visible. */
+  getNotifyBot: () =>
+    api.get<NotifyBotInfo>("/settings/notify/bot").then((r) => r.data),
+  /** Chats the bot has heard from lately, for filling in the default target. */
+  getNotifyBotChats: () =>
+    api
+      .get<{ ok: boolean; chats?: NotifyBotChat[]; error?: string }>(
+        "/settings/notify/bot/chats",
+      )
+      .then((r) => r.data),
+  /**
+   * Sends a real message now: the only check that proves the whole path works. An unsaved
+   * token or target can be passed to try it before committing to it.
+   */
+  testNotifyBot: (target?: string, token?: string) =>
+    api
+      .post<{ ok: boolean; error?: string }>("/settings/notify/bot/test", {
+        ...(target ? { target } : {}),
+        ...(token ? { token } : {}),
+      })
+      .then((r) => r.data),
+};
+
+// ── Database ───────────────────────────────────────────────────────────────────
+// Bemby stores everything in MongoDB, which it cannot read from the database itself, so the
+// connection is the one setting that lives outside it. These calls are deliberately
+// reachable before everything else: the panel has to be able to ask "is there a database?"
+// -- and to be handed the answer "no" -- without one.
+
+export type DatabaseStatus = {
+  ready: boolean;
+  connecting: boolean;
+  configured: boolean;
+  error: string | null;
+  /** Where the connection came from: the panel, the environment, or nowhere yet. */
+  source: "ui" | "env" | "none";
+  database: string;
+  /** The URI with its password replaced, safe to show in a text field. */
+  uriMasked: string;
+  serverVersion: string | null;
+  /** Where the panel's connection is written, for the operator's own notes. */
+  configPath: string;
+  sqliteImported: boolean;
+  counts: Record<string, number> | null;
+};
+
+export type DatabaseTestResult = {
+  ok: boolean;
+  message: string;
+  latencyMs?: number;
+  serverVersion?: string;
+  database?: string;
+  collections?: string[];
+};
+
+export type SqliteImportResult = {
+  ok: boolean;
+  tables: Record<string, number>;
+  skipped: string[];
+  message: string;
+};
+
+export const databaseApi = {
+  status: () => api.get<DatabaseStatus>("/database/status").then((r) => r.data),
+  /** Checks a typed-in URI without adopting it. */
+  test: (uri: string, dbName?: string) =>
+    api.post<DatabaseTestResult>("/database/test", { uri, dbName }).then((r) => r.data),
+  /** Saves the connection and switches Bemby onto it. */
+  save: (uri: string, dbName?: string, migrate?: boolean) =>
+    api
+      .post<{ ok: boolean; message: string; migration?: SqliteImportResult }>(
+        "/database/config",
+        { uri, dbName, migrate },
+      )
+      .then((r) => r.data),
+  importSqlite: () =>
+    api.post<SqliteImportResult>("/database/migrate-sqlite").then((r) => r.data),
+  /** Drops the panel's connection, falling back to MONGODB_URI or to unconfigured. */
+  disconnect: () =>
+    api.post<DatabaseStatus>("/database/disconnect").then((r) => r.data),
+};
+
+export type NotifyBotInfo = {
+  configured: boolean;
+  ok?: boolean;
+  id?: number;
+  username?: string;
+  name?: string;
+  error?: string;
+};
+
+export type NotifyBotChat = { id: number; type: string; title: string };
+
+/** A stored CloakBrowser licence key as the server will show it: never the raw value. */
+export type CfKeyView = { label: string; masked: string };
+
+export type CfKeysResponse = { keys: CfKeyView[]; total: number; inUse: number };
+
+export type CfKeyCheck = {
+  label: string;
+  masked: string;
+  valid: boolean;
+  plan?: string;
+  expires?: string;
+  error?: string;
+};
+
+export type ProxyProviderType = "webshare" | "list";
+
+export type ProxyProvider = {
+  id: string;
+  name: string;
+  type: ProxyProviderType;
+  /** Never returned by the server; send a value to set or change it. */
+  apiKey?: string;
+  /** True when the server holds a key for this provider. */
+  hasKey?: boolean;
+  url?: string;
+  scheme?: "http" | "socks5";
+  enabled?: boolean;
+};
+
+export type ProxySyncResult = {
+  ok: boolean;
+  error?: string;
+  added?: number;
+  updated?: number;
+  removed?: number;
+  total?: number;
+  providers?: Array<{
+    providerId: string;
+    name: string;
+    ok: boolean;
+    fetched?: number;
+    error?: string;
+  }>;
+};
+
+// ── AI Suppliers ──────────────────────────────────────────────────────────────
+
+export type AiModel = {
+  id: number;
+  supplier_id: number;
+  model_id: string;
+  label: string | null;
+};
+
+export type AiSupplier = {
+  id: number;
+  name: string;
+  base_url: string;
+  api_key: string;
+  timeout_ms: number;
+  models: AiModel[];
+};
+
+export const aiSuppliersApi = {
+  list: () => api.get<AiSupplier[]>("/ai-suppliers").then((r) => r.data),
+  create: (data: Omit<AiSupplier, "id" | "models">) =>
+    api.post<AiSupplier>("/ai-suppliers", data).then((r) => r.data),
+  update: (id: number, data: Partial<Omit<AiSupplier, "id" | "models">>) =>
+    api.put<AiSupplier>(`/ai-suppliers/${id}`, data).then((r) => r.data),
+  remove: (id: number) => api.delete(`/ai-suppliers/${id}`).then((r) => r.data),
+  addModel: (supplierId: number, model_id: string, label?: string) =>
+    api
+      .post<AiModel>(`/ai-suppliers/${supplierId}/models`, { model_id, label })
+      .then((r) => r.data),
+  removeModel: (supplierId: number, modelId: number) =>
+    api
+      .delete(`/ai-suppliers/${supplierId}/models/${modelId}`)
+      .then((r) => r.data),
+};
+
+// ── Data Import / Export ───────────────────────────────────────────────────────
+
+export type ExportPayload = {
+  version: "1";
+  exportedAt: string;
+  accounts: Array<{
+    name: string;
+    phoneNumber: string;
+    apiId: number;
+    apiHash: string;
+    sessionString: string | null;
+    authStatus: string;
+  }>;
+  templates?: Array<{
+    name: string;
+    jobType: string;
+    botUsername: string;
+    timezone: string;
+    replyTimeoutMs: number;
+    retryMax: number;
+    config: string | null;
+    startCommand: string;
+    checkinButton: string;
+  }>;
+  jobs: Array<{
+    accountIndex: number | null;
+    templateIndex?: number | null;
+    name: string;
+    jobType: string;
+    botUsername: string;
+    scheduleWindowStart: number;
+    scheduleWindowEnd: number;
+    timezone: string;
+    replyTimeoutMs: number;
+    retryMax: number;
+    enabled: boolean;
+    config: string | null;
+    startCommand: string;
+    checkinButton: string;
+  }>;
+  aiSuppliers?: Array<{
+    name: string;
+    baseUrl: string;
+    apiKey: string;
+    timeoutMs: number;
+  }>;
+  aiModels?: Array<{
+    supplierIndex: number;
+    modelId: string;
+    label: string | null;
+  }>;
+  settings: Record<string, string>;
+};
+
+export type EncryptedEnvelope = {
+  encrypted: true;
+  version: "1";
+  salt: string;
+  iv: string;
+  tag: string;
+  data: string;
+};
+
+export type ImportResult = {
+  message: string;
+  accountsImported: number;
+  accountsSkipped: number;
+  templatesImported: number;
+  jobsImported: number;
+  aiSuppliersImported: number;
+  aiModelsImported: number;
+  settingsUpdated: number;
+};
+
+export const dataApi = {
+  export: (secret?: string) =>
+    api
+      .post<ExportPayload | EncryptedEnvelope>("/data/export", { secret })
+      .then((r) => r.data),
+  import: (
+    data: ExportPayload | EncryptedEnvelope,
+    mode: "merge" | "replace",
+    secret?: string,
+    forceReauth = true,
+    confirmPassword?: string,
+  ) =>
+    api
+      .post<ImportResult>("/data/import", { data, mode, secret, forceReauth, confirmPassword })
+      .then((r) => r.data),
+};
+
+// ── TG Live Client ────────────────────────────────────────────────────────────
+
+export type TgDialog = {
+  chatId: string;
+  name: string;
+  type: "user" | "bot" | "group" | "channel";
+  username: string | null;
+  unreadCount: number;
+  lastMessage: { text: string; date: number; fromMe: boolean } | null;
+  left?: boolean; // not a member; join required to send messages
+  muted?: boolean;
+  pinned?: boolean;
+};
+
+export type TgButton = {
+  text: string;
+  data: string | null;
+  url: string | null;
+  webApp: boolean; // Telegram Mini App -- must open in a real browser
+  send: boolean; // reply-keyboard button -- clicking sends its text as a message
+};
+
+export type TgReaction = {
+  emoji: string;
+  count: number;
+  mine: boolean;
+};
+
+export type TgInvitePreview = {
+  hash: string;
+  title: string;
+  memberCount: number;
+  type: "group" | "channel";
+  alreadyJoined: boolean;
+  chatId?: string;
+};
+
+export type TgMessage = {
+  id: number;
+  text: string;
+  html: string | null;
+  date: number;
+  fromMe: boolean;
+  isRead: boolean;
+  fromId: string | null;
+  fromName: string | null;
+  hasPhoto: boolean;
+  hasDocument: boolean;
+  hasSticker: boolean;
+  fileName: string | null;
+  buttons: TgButton[][] | null;
+  reactions: TgReaction[] | null;
+  replyToId: number | null;
+  replyToText: string | null;
+  replyToName: string | null;
+  replyCount: number | null;
+};
+
+export type TgContact = {
+  chatId: string;
+  firstName: string;
+  lastName: string;
+  username: string | null;
+  phone: string | null;
+};
+
+export type TgProfile = {
+  chatId: string;
+  /** The ID as Telegram shows it, which is what a job's chat field takes. */
+  peerId: string;
+  name: string;
+  type: "user" | "bot" | "group" | "channel";
+  username: string | null;
+  phone: string | null;
+  bio: string | null;
+  memberCount: number | null;
+  firstName: string | null;
+  lastName: string | null;
+  blocked: boolean | null;
+};
+
+export type TgReportReason =
+  | "spam"
+  | "violence"
+  | "pornography"
+  | "childAbuse"
+  | "illegalDrugs"
+  | "personalDetails"
+  | "fake"
+  | "copyright"
+  | "other";
+
+/** A Mini App a bot pins beside the composer. */
+export type TgBotMenuButton = { text: string; url: string };
+
+export type TgBotCommand = {
+  command: string;
+  description: string;
+};
+
+export type TgFolder = {
+  id: number;
+  title: string;
+  emoticon: string | null;
+  includeGroups: boolean;
+  includeBroadcasts: boolean;
+  includeBots: boolean;
+  includeContacts: boolean;
+  includeNonContacts: boolean;
+  pinnedChatIds: string[];
+  includedChatIds: string[];
+  excludedChatIds: string[];
+};
+
+export const tgClientApi = {
+  dialogs: (
+    accountId: number,
+    params?: { limit?: number },
+    signal?: AbortSignal,
+  ) =>
+    api
+      .get<TgDialog[]>(`/tg-client/${accountId}/dialogs`, { params, signal })
+      .then((r) => r.data),
+
+  messages: (
+    accountId: number,
+    chatId: string,
+    params?: { limit?: number; offsetId?: number; fresh?: 1 },
+    signal?: AbortSignal,
+  ) =>
+    api
+      .get<TgMessage[]>(
+        `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}`,
+        { params, signal },
+      )
+      .then((r) => r.data),
+
+  searchMessages: (
+    accountId: number,
+    chatId: string,
+    q: string,
+    params?: { limit?: number },
+    signal?: AbortSignal,
+  ) =>
+    api
+      .get<TgMessage[]>(
+        `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/search`,
+        { params: { q, ...params }, signal },
+      )
+      .then((r) => r.data),
+
+  send: (
+    accountId: number,
+    chatId: string,
+    text: string,
+    replyToMsgId?: number,
+  ) =>
+    api
+      .post<{
+        id: number;
+        date: number;
+      }>(`/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}`, {
+        text,
+        ...(replyToMsgId ? { replyToMsgId } : {}),
+      })
+      .then((r) => r.data),
+
+  sendFile: (
+    accountId: number,
+    chatId: string,
+    file: File,
+    opts?: { caption?: string; asDocument?: boolean; replyToMsgId?: number },
+  ) =>
+    file.arrayBuffer().then((buf) =>
+      api
+        .post<{
+          id: number;
+          date: number;
+          hasPhoto: boolean;
+          hasDocument: boolean;
+        }>(
+          `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/file`,
+          buf,
+          {
+            headers: { "Content-Type": "application/octet-stream" },
+            params: {
+              filename: file.name,
+              ...(opts?.caption ? { caption: opts.caption } : {}),
+              ...(opts?.asDocument ? { asDocument: "1" } : {}),
+              ...(opts?.replyToMsgId ? { replyToMsgId: opts.replyToMsgId } : {}),
+            },
+          },
+        )
+        .then((r) => r.data),
+    ),
+
+  contacts: (accountId: number) =>
+    api
+      .get<TgContact[]>(`/tg-client/${accountId}/contacts`)
+      .then((r) => r.data),
+
+  addContact: (
+    accountId: number,
+    phone: string,
+    firstName: string,
+    lastName?: string,
+  ) =>
+    api
+      .post<TgContact>(`/tg-client/${accountId}/contacts`, {
+        phone,
+        firstName,
+        lastName,
+      })
+      .then((r) => r.data),
+
+  editContact: (
+    accountId: number,
+    userId: string,
+    firstName: string,
+    lastName?: string,
+  ) =>
+    api
+      .put<TgContact>(
+        `/tg-client/${accountId}/contacts/${encodeURIComponent(userId)}`,
+        { firstName, lastName },
+      )
+      .then((r) => r.data),
+
+  search: (accountId: number, q: string) =>
+    api
+      .get<TgDialog[]>(`/tg-client/${accountId}/search`, { params: { q } })
+      .then((r) => r.data),
+
+  // An <img src> cannot set an Authorization header, so the address carries a short-lived
+  // media ticket. The session token used to go here, which put a seven-day credential into
+  // the browser's history and the server's access log for every image on screen.
+  photoUrl: (accountId: number, chatId: string, msgId: number) =>
+    `/api/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/${msgId}/photo?ticket=${encodeURIComponent(mediaTicket.value)}`,
+
+  /** Fetches (or refreshes) the media ticket. Cheap, and idempotent enough to call on open. */
+  ensureMediaTicket: async (): Promise<void> => {
+    if (mediaTicket.value && Date.now() < mediaTicketExpiry - TICKET_REFRESH_MARGIN_MS) return;
+    const { ticket, expiresAt } = await api
+      .post<{ ticket: string; expiresAt: number }>("/tg-client/media-ticket")
+      .then((r) => r.data);
+    mediaTicket.value = ticket;
+    mediaTicketExpiry = expiresAt;
+  },
+
+  folders: (accountId: number) =>
+    api.get<TgFolder[]>(`/tg-client/${accountId}/folders`).then((r) => r.data),
+
+  addChatToFolder: (accountId: number, folderId: number, chatId: string) =>
+    api
+      .post(`/tg-client/${accountId}/folders/${folderId}/chats`, { chatId })
+      .then((r) => r.data),
+
+  avatarsBatch: (accountId: number, chatIds: string[]) =>
+    api
+      .get<Record<string, string>>(
+        `/tg-client/${accountId}/avatars?ids=${chatIds.map(encodeURIComponent).join(",")}`,
+      )
+      .then((r) => r.data),
+
+  profile: (accountId: number, chatId: string) =>
+    api
+      .get<TgProfile>(
+        `/tg-client/${accountId}/profile/${encodeURIComponent(chatId)}`,
+      )
+      .then((r) => r.data),
+
+  mute: (accountId: number, chatId: string, muteSecs: number) =>
+    api
+      .post<{
+        ok: boolean;
+      }>(`/tg-client/${accountId}/mute/${encodeURIComponent(chatId)}`, {
+        muteSecs,
+      })
+      .then((r) => r.data),
+
+  pin: (accountId: number, chatId: string, pinned: boolean) =>
+    api
+      .post<{
+        ok: boolean;
+      }>(`/tg-client/${accountId}/pin/${encodeURIComponent(chatId)}`, {
+        pinned,
+      })
+      .then((r) => r.data),
+
+  clickButton: (
+    accountId: number,
+    chatId: string,
+    msgId: number,
+    data: string,
+  ) =>
+    api
+      .post<{
+        alert: boolean;
+        message: string | null;
+        url: string | null;
+      }>(
+        `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/${msgId}/button`,
+        { data },
+      )
+      .then((r) => r.data),
+
+  sendTyping: (accountId: number, chatId: string) =>
+    api
+      .post<{
+        ok: boolean;
+      }>(`/tg-client/${accountId}/typing/${encodeURIComponent(chatId)}`)
+      .then((r) => r.data),
+
+  setBlocked: (accountId: number, chatId: string, blocked: boolean) =>
+    api
+      .post<{
+        ok: boolean;
+      }>(`/tg-client/${accountId}/block/${encodeURIComponent(chatId)}`, {
+        blocked,
+      })
+      .then((r) => r.data),
+
+  report: (
+    accountId: number,
+    chatId: string,
+    reason: TgReportReason,
+    comment?: string,
+  ) =>
+    api
+      .post<{
+        ok: boolean;
+      }>(`/tg-client/${accountId}/report/${encodeURIComponent(chatId)}`, {
+        reason,
+        ...(comment ? { comment } : {}),
+      })
+      .then((r) => r.data),
+
+  frameable: (url: string) =>
+    api
+      .get<{ frameable: boolean }>("/tg-client/frameable", { params: { url } })
+      .then((r) => r.data),
+
+  // An address for the viewer iframe carrying a ticket instead of the session token, which
+  // the page itself would be able to read off its own URL
+  webviewTicket: (url: string, mode: "app" | "page") =>
+    api
+      .post<{ proxyUrl: string; isolated: boolean; expiresAt: number }>("/tg-client/webview/ticket", {
+        url,
+        mode,
+      })
+      .then((r) => r.data),
+
+  clearAccountCache: (accountId: number) =>
+    api
+      .delete<{ ok: boolean }>(`/tg-client/${accountId}/cache`)
+      .then((r) => r.data),
+
+  cleanAccount: (accountId: number) =>
+    api
+      .post<{
+        ok: boolean;
+        left: number;
+        deleted: number;
+        contacts: number;
+        folders: number;
+        failed: { chatId: string; name: string; error: string }[];
+      }>(`/tg-client/${accountId}/clean`)
+      .then((r) => r.data),
+
+  deleteHistory: (accountId: number, chatId: string, revoke: boolean) =>
+    api
+      .delete<{
+        ok: boolean;
+      }>(`/tg-client/${accountId}/history/${encodeURIComponent(chatId)}`, {
+        params: revoke ? { revoke: 1 } : {},
+      })
+      .then((r) => r.data),
+
+  deleteMessages: (
+    accountId: number,
+    chatId: string,
+    ids: number[],
+    revoke: boolean,
+  ) =>
+    api
+      .post<{
+        ok: boolean;
+      }>(
+        `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/delete`,
+        { ids, revoke },
+      )
+      .then((r) => r.data),
+
+  editMessage: (accountId: number, chatId: string, msgId: number, text: string) =>
+    api
+      .post<{
+        ok: boolean;
+      }>(
+        `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/${msgId}/edit`,
+        { text },
+      )
+      .then((r) => r.data),
+
+  forwardMessages: (
+    accountId: number,
+    chatId: string,
+    toChatId: string,
+    ids: number[],
+  ) =>
+    api
+      .post<{
+        ok: boolean;
+      }>(
+        `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/forward`,
+        { toChatId, ids },
+      )
+      .then((r) => r.data),
+
+  clearCache: (accountId: number, chatId: string) =>
+    api
+      .delete(
+        `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/cache`,
+      )
+      .then((r) => r.data),
+
+  sendReaction: (
+    accountId: number,
+    chatId: string,
+    msgId: number,
+    emoji: string | null,
+  ) =>
+    api
+      .post<{
+        ok: boolean;
+      }>(
+        `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/${msgId}/reaction`,
+        { emoji },
+      )
+      .then((r) => r.data),
+
+  /** The bot's commands and its menu button (the Mini App pinned beside the composer). */
+  botInfo: (accountId: number, chatId: string) =>
+    api
+      .get<{ commands: TgBotCommand[]; menuButton: TgBotMenuButton | null }>(
+        `/tg-client/${accountId}/bot-info/${encodeURIComponent(chatId)}`,
+      )
+      .then((r) => r.data),
+
+  threadMessages: (
+    accountId: number,
+    chatId: string,
+    msgId: number,
+    params?: { limit?: number; offsetId?: number },
+  ) =>
+    api
+      .get<TgMessage[]>(
+        `/tg-client/${accountId}/messages/${encodeURIComponent(chatId)}/${msgId}/thread`,
+        { params },
+      )
+      .then((r) => r.data),
+
+  markRead: (accountId: number, chatId: string, maxId: number) =>
+    api
+      .post(`/tg-client/${accountId}/mark-read/${encodeURIComponent(chatId)}`, {
+        maxId,
+      })
+      .then((r) => r.data),
+
+  resolvePeer: (accountId: number, username: string) =>
+    api
+      .post<TgDialog>(`/tg-client/${accountId}/resolve-peer`, { username })
+      .then((r) => r.data),
+
+  reconnect: (accountId: number) =>
+    api.post(`/tg-client/${accountId}/reconnect`).then((r) => r.data),
+
+  checkInvite: (accountId: number, hash: string) =>
+    api
+      .get<TgInvitePreview>(
+        `/tg-client/${accountId}/invite/${encodeURIComponent(hash)}`,
+      )
+      .then((r) => r.data),
+
+  joinInvite: (accountId: number, hash: string) =>
+    api
+      .post<TgDialog>(
+        `/tg-client/${accountId}/invite/${encodeURIComponent(hash)}`,
+      )
+      .then((r) => r.data),
+
+  join: (accountId: number, chatId: string) =>
+    api
+      .post<{
+        ok: boolean;
+        joined?: boolean;
+        requestSent?: boolean;
+      }>(`/tg-client/${accountId}/join/${encodeURIComponent(chatId)}`)
+      .then((r) => r.data),
+
+  leave: (accountId: number, chatId: string) =>
+    api
+      .post<{ ok: boolean }>(
+        `/tg-client/${accountId}/leave/${encodeURIComponent(chatId)}`,
+      )
+      .then((r) => r.data),
+
+  membership: (accountId: number, chatId: string) =>
+    api
+      .get<{
+        member: boolean;
+      }>(`/tg-client/${accountId}/membership/${encodeURIComponent(chatId)}`)
+      .then((r) => r.data),
+
+  pinnedMessage: (accountId: number, chatId: string) =>
+    api
+      .get<TgMessage | null>(
+        `/tg-client/${accountId}/chats/${encodeURIComponent(chatId)}/pinned`,
+      )
+      .then((r) => r.data),
+
+  startBot: (accountId: number, username: string, startParam: string) =>
+    api
+      .post<TgDialog>(
+        `/tg-client/${accountId}/start-bot/${encodeURIComponent(username)}`,
+        {
+          startParam,
+        },
+      )
+      .then((r) => r.data),
+
+  webviewResolve: (
+    accountId: number,
+    url: string,
+    botChatId?: string | null,
+    peerChatId?: string | null,
+    /** The address came from the bot's menu button; Telegram signs that case only when told. */
+    fromBotMenu?: boolean,
+  ) =>
+    api
+      .post<{
+        webAppUrl: string;
+        resolved: boolean;
+        frameable: boolean;
+        /** Telegram attached the account data. False means the app will load logged out. */
+        signed: boolean;
+      }>(`/tg-client/${accountId}/webview/resolve`, {
+        url,
+        botChatId,
+        peerChatId,
+        fromBotMenu,
+      })
+      .then((r) => r.data),
+};
+
+// ── AI Debug ──────────────────────────────────────────────────────────────────
+
+export const debugApi = {
+  runAi: (
+    images: string[],
+    prompt: string,
+    maxTokens?: number,
+    model?: string,
+  ) =>
+    api
+      .post<{
+        response: string;
+        durationMs: number;
+      }>("/debug/ai", { images, prompt, maxTokens, model })
+      .then((r) => r.data),
+};

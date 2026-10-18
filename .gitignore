@@ -1,0 +1,38 @@
+node_modules/
+
+# Build outputs
+backend/dist/
+backend/public/
+frontend/dist/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.pfx
+
+# SQLite database and persistent data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Session / auth tokens
+*.string
+session_string*
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# OS / editor artefacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/settings.json

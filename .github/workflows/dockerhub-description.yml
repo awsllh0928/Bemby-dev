@@ -1,0 +1,31 @@
+name: Update Docker Hub description
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'README.md'
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  push-readme:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rewrite relative image paths to absolute GitHub raw URLs
+        run: |
+          sed 's|src="docs/|src="https://raw.githubusercontent.com/${{ github.repository }}/main/docs/|g' \
+            README.md > /tmp/DOCKERHUB.md
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/bemby
+          readme-filepath: /tmp/DOCKERHUB.md
+          short-description: Self-hosted Telegram check-in and Emby watch session automation with web admin portal

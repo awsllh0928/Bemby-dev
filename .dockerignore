@@ -1,0 +1,11 @@
+**/node_modules
+**/dist
+backend/.env
+# Runtime data at any depth, not just the repo root. backend/data/ holds the
+# SQLite DB (with session strings), the downloaded browser and the CF profiles:
+# gigabytes that must never enter the build context or a build layer.
+data/
+**/data/
+.git
+.gitignore
+*.md

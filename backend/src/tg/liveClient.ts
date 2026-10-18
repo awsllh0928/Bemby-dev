@@ -1,0 +1,2784 @@
+import { TelegramClient, Api, Logger } from "telegram";
+import { CustomFile } from "telegram/client/uploads";
+import { LogLevel } from "telegram/extensions/Logger";
+import { StringSession } from "telegram/sessions";
+import { NewMessage, Raw, type NewMessageEvent } from "telegram/events";
+import { getDefaultTgApiCredentials } from "../db/database";
+import { col } from "../db/collection";
+import { updateAccount } from "../db/repos/accounts";
+import { getSetting } from "../db/repos/settings";
+import {
+  getCachedMessages as readCachedMessages,
+  cacheMessages as writeCachedMessages,
+  updateCachedMessageText as writeCachedMessagePayload,
+  removeCachedMessages as deleteCachedMessages,
+  clearCachedMessages as dropCachedMessages,
+  clearAccountCache as dropAccountCache,
+  getCachedDialogs as readCachedDialogs,
+  cacheDialogs as writeCachedDialogs,
+  removeCachedDialog as deleteCachedDialog,
+  pruneCachedDialogs as dropStaleCachedDialogs,
+  maxCachedMessageId as readMaxCachedMessageId,
+} from "../db/repos/cache";
+import type { AccountDoc, MessageCacheDoc } from "../db/types";
+import { decryptAccountRow } from "../db/secretColumns";
+import { escapeHtml as escHtml, safeHref } from "./htmlEscape";
+import { parseTgProxy } from "../jobs/runner";
+import { resolveAppClientParams } from "./appClient";
+import { parseMiniAppLink, withClientLaunchParams } from "./miniApp";
+import { displayPeerId } from "./peerTarget";
+
+export type TgLiveMessage = {
+  chatId: string;
+  message: TgMsgPayload;
+};
+
+export type TgReaction = {
+  emoji: string;
+  count: number;
+  mine: boolean;
+};
+
+export type TgButton = {
+  text: string;
+  data: string | null; // base64-encoded callback data
+  url: string | null;
+  webApp: boolean; // Telegram Mini App button -- must open in a real browser
+  send: boolean; // reply-keyboard button -- clicking sends its text as a message
+};
+
+export type TgMsgPayload = {
+  id: number;
+  text: string;
+  html: string | null; // safe HTML with entity markup; null = plain text
+  date: number;
+  fromMe: boolean;
+  isRead: boolean; // true when recipient has read this outgoing message
+  fromId: string | null;
+  fromName: string | null;
+  hasPhoto: boolean;
+  hasDocument: boolean;
+  hasSticker: boolean;
+  fileName: string | null;
+  buttons: TgButton[][] | null;
+  reactions: TgReaction[] | null;
+  replyToId: number | null;
+  replyToText: string | null;
+  replyToName: string | null;
+  replyCount: number | null;
+};
+
+export type TgDialogItem = {
+  chatId: string;
+  name: string;
+  type: "user" | "bot" | "group" | "channel";
+  username: string | null;
+  unreadCount: number;
+  lastMessage: { text: string; date: number; fromMe: boolean } | null;
+  left?: boolean; // true when the current user is not a member (search/resolve results)
+  muted?: boolean;
+  pinned?: boolean;
+};
+
+/** A Mini App a bot pins beside the composer. */
+export type TgBotMenuButton = { text: string; url: string };
+
+export type TgContactItem = {
+  chatId: string;
+  firstName: string;
+  lastName: string;
+  username: string | null;
+  phone: string | null;
+};
+
+type LiveEntry = {
+  client: TelegramClient;
+  entityCache: Map<string, Api.User | Api.Chat | Api.Channel>;
+  subscribers: Set<(msg: TgLiveMessage) => void>;
+  dialogSubscribers: Set<(dialogs: TgDialogItem[]) => void>;
+  // Per-entry avatar cache: chatId -> Buffer (has avatar) | null (no avatar) | undefined (not fetched)
+  avatarCache: Map<string, Buffer | null>;
+  // Tracks the highest outgoing message ID the recipient has read, per chatId
+  readOutboxCache: Map<string, number>;
+  readSubscribers: Set<(chatId: string, maxId: number) => void>;
+  typingSubscribers: Set<(event: TgTypingEvent) => void>;
+  // Full dialog list cached briefly so per-keystroke searches don't refetch
+  dialogSearchCache?: { ts: number; items: TgDialogItem[] };
+  // Last time this entry was requested or had subscribers -- drives idle eviction
+  lastActiveAt: number;
+};
+
+export type TgTypingEvent = {
+  chatId: string;
+  userId: string | null;
+  userName: string | null;
+  cancelled: boolean;
+};
+
+const liveClients = new Map<number, LiveEntry>();
+
+// --- Idle eviction and cache bounds (issue #14) ---
+// A connected client receives every update for its account and GramJS's
+// internal entity cache grows for as long as the client lives, so memory
+// climbs steadily on long-running deployments. Evict clients nobody is
+// watching and keep the per-entry caches bounded.
+
+const IDLE_DISCONNECT_MS = 30 * 60_000;
+const SWEEP_INTERVAL_MS = 5 * 60_000;
+const ENTITY_CACHE_MAX = 1_000;
+const AVATAR_CACHE_MAX = 300;
+const READ_OUTBOX_CACHE_MAX = 1_000;
+
+// A live client per account is several MB of GramJS state plus a connection, so on a
+// small host the account count, not idle time, is what runs memory out. Evict the
+// least recently used client nobody is watching once past this many.
+const LIVE_CLIENT_MAX = Number(process.env.TG_LIVE_CLIENT_MAX ?? 8);
+
+// Inline media is buffered whole to serve it, so a large video would spike the heap by
+// its full size. Anything bigger is refused rather than risking the process.
+const MEDIA_MAX_BYTES = Number(process.env.TG_MEDIA_MAX_MB ?? 25) * 1024 * 1024;
+
+function hasSubscribers(entry: LiveEntry): boolean {
+  return (
+    entry.subscribers.size > 0 ||
+    entry.dialogSubscribers.size > 0 ||
+    entry.readSubscribers.size > 0 ||
+    entry.typingSubscribers.size > 0
+  );
+}
+
+// Maps iterate in insertion order, so this drops the oldest entries first
+function trimCache(cache: Map<string, unknown>, max: number): void {
+  for (const key of cache.keys()) {
+    if (cache.size <= max) return;
+    cache.delete(key);
+  }
+}
+
+/**
+ * Drops the least recently used clients once the registry is over LIVE_CLIENT_MAX.
+ * Entries with subscribers (someone is watching that account) and `keepId` (the one
+ * just handed out) are never evicted, so the cap can be exceeded when more accounts
+ * than that are genuinely being watched at once.
+ */
+function evictSurplusClients(keepId?: number): void {
+  if (liveClients.size <= LIVE_CLIENT_MAX) return;
+  const candidates = [...liveClients.entries()]
+    .filter(([id, e]) => id !== keepId && !hasSubscribers(e))
+    .sort((a, b) => a[1].lastActiveAt - b[1].lastActiveAt);
+
+  for (const [accountId, entry] of candidates) {
+    if (liveClients.size <= LIVE_CLIENT_MAX) return;
+    liveClients.delete(accountId);
+    entry.client.destroy().catch(() => {});
+    console.log(`[tg] Evicted idle live client for account ${accountId} (over LIVE_CLIENT_MAX)`);
+  }
+}
+
+export function sweepLiveClients(now = Date.now()): void {
+  for (const [accountId, entry] of liveClients) {
+    if (hasSubscribers(entry)) entry.lastActiveAt = now;
+
+    if (now - entry.lastActiveAt >= IDLE_DISCONNECT_MS) {
+      liveClients.delete(accountId);
+      // destroy() tears down the update loop and senders; disconnect() alone
+      // keeps the client reusable and holding its internal caches
+      entry.client.destroy().catch(() => {});
+      continue;
+    }
+
+    trimCache(entry.entityCache, ENTITY_CACHE_MAX);
+    trimCache(entry.avatarCache, AVATAR_CACHE_MAX);
+    trimCache(entry.readOutboxCache, READ_OUTBOX_CACHE_MAX);
+  }
+  // A client whose subscribers have gone becomes evictable, so re-check the cap here
+  // rather than only when a new one is created.
+  evictSurplusClients();
+}
+
+// unref() so the sweep never keeps the process (or test runner) alive
+setInterval(() => sweepLiveClients(), SWEEP_INTERVAL_MS).unref();
+
+type AccountRow = {
+  api_id: number | null;
+  api_hash: string | null;
+  session_string: string | null;
+  proxy_id: string | null;
+  app_client_id: string | null;
+};
+
+// Derive a stable chatId string from an entity
+export function entityToChatId(
+  entity: Api.User | Api.Chat | Api.Channel,
+): string {
+  const id = entity.id.toString();
+  if (entity instanceof Api.User) return `u${id}`;
+  if (entity instanceof Api.Channel) return `c${id}`;
+  return `g${id}`;
+}
+
+// Build chatId from a peer reference
+export function peerToChatId(peer: Api.TypePeer): string {
+  if (peer instanceof Api.PeerUser) return `u${peer.userId.toString()}`;
+  if (peer instanceof Api.PeerChannel) return `c${peer.channelId.toString()}`;
+  if (peer instanceof Api.PeerChat) return `g${peer.chatId.toString()}`;
+  return "";
+}
+
+// Reverse of peerToChatId -- used as a fallback entity lookup key
+function chatIdToPeer(chatId: string): Api.TypePeer | null {
+  try {
+    if (chatId.startsWith("u"))
+      return new Api.PeerUser({ userId: BigInt(chatId.slice(1)) as any });
+    if (chatId.startsWith("c"))
+      return new Api.PeerChannel({ channelId: BigInt(chatId.slice(1)) as any });
+    if (chatId.startsWith("g"))
+      return new Api.PeerChat({ chatId: BigInt(chatId.slice(1)) as any });
+  } catch {
+    /* ignore malformed ids */
+  }
+  return null;
+}
+
+
+// Converts Telegram message entities to safe HTML. Returns null when there are
+// no formatting entities (plain text can be rendered directly).
+function entitiesToHtml(
+  text: string,
+  entities: Api.TypeMessageEntity[] | undefined,
+): string | null {
+  if (!entities?.length) return null;
+
+  type Span = { offset: number; end: number; open: string; close: string };
+  const spans: Span[] = [];
+
+  for (const e of entities) {
+    const end = e.offset + e.length;
+    if (e instanceof Api.MessageEntityTextUrl) {
+      const safe = safeHref(e.url ?? "");
+      if (safe) {
+        spans.push({
+          offset: e.offset,
+          end,
+          open: `<a href="${escHtml(safe)}" class="tgc-link" data-tgurl>`,
+          close: "</a>",
+        });
+      }
+    } else if (e instanceof Api.MessageEntityUrl) {
+      const url = text.slice(e.offset, end);
+      const safe = safeHref(url);
+      if (safe) {
+        spans.push({
+          offset: e.offset,
+          end,
+          open: `<a href="${escHtml(safe)}" class="tgc-link" data-tgurl>`,
+          close: "</a>",
+        });
+      }
+    } else if (e instanceof Api.MessageEntityMention) {
+      const handle = text.slice(e.offset + 1, end); // strip leading @
+      spans.push({
+        offset: e.offset,
+        end,
+        open: `<a href="https://t.me/${escHtml(handle)}" class="tgc-link" data-tgurl>`,
+        close: "</a>",
+      });
+    } else if (e instanceof Api.MessageEntityBold) {
+      spans.push({
+        offset: e.offset,
+        end,
+        open: "<strong>",
+        close: "</strong>",
+      });
+    } else if (e instanceof Api.MessageEntityItalic) {
+      spans.push({ offset: e.offset, end, open: "<em>", close: "</em>" });
+    } else if (e instanceof Api.MessageEntityUnderline) {
+      spans.push({ offset: e.offset, end, open: "<u>", close: "</u>" });
+    } else if (e instanceof Api.MessageEntityStrike) {
+      spans.push({ offset: e.offset, end, open: "<s>", close: "</s>" });
+    } else if (e instanceof Api.MessageEntityCode) {
+      spans.push({ offset: e.offset, end, open: "<code>", close: "</code>" });
+    } else if (e instanceof Api.MessageEntityPre) {
+      spans.push({ offset: e.offset, end, open: "<pre>", close: "</pre>" });
+    }
+  }
+
+  if (!spans.length) return null;
+
+  // Sort by offset ascending; longer spans first at same offset
+  spans.sort((a, b) => a.offset - b.offset || b.end - a.end);
+
+  let html = "";
+  let pos = 0;
+  for (const span of spans) {
+    if (span.offset < pos) continue; // skip overlapping spans
+    if (span.offset > pos)
+      html += escHtml(text.slice(pos, span.offset)).replace(/\n/g, "<br>");
+    html += span.open + escHtml(text.slice(span.offset, span.end)) + span.close;
+    pos = span.end;
+  }
+  if (pos < text.length)
+    html += escHtml(text.slice(pos)).replace(/\n/g, "<br>");
+  return html;
+}
+
+function entityName(entity: Api.User | Api.Chat | Api.Channel): string {
+  if (entity instanceof Api.User) {
+    return (
+      [entity.firstName, entity.lastName].filter(Boolean).join(" ") ||
+      entity.username ||
+      "Unknown"
+    );
+  }
+  return (entity as any).title ?? (entity as any).username ?? "Unknown";
+}
+
+function extractButtons(msg: Api.Message): TgButton[][] | null {
+  if (!msg.replyMarkup) return null;
+  if (msg.replyMarkup instanceof Api.ReplyInlineMarkup) {
+    return msg.replyMarkup.rows.map((row) =>
+      row.buttons.map((btn: any): TgButton => ({
+        text: btn.text ?? "",
+        data: btn.data ? Buffer.from(btn.data).toString("base64") : null,
+        url: btn.url ?? null,
+        webApp:
+          btn instanceof Api.KeyboardButtonWebView ||
+          btn instanceof Api.KeyboardButtonSimpleWebView,
+        send: false,
+      })),
+    );
+  }
+  // Reply keyboards (e.g. @SpamBot's "This is a mistake"): plain buttons whose
+  // text is sent back as a message when tapped.
+  if (msg.replyMarkup instanceof Api.ReplyKeyboardMarkup) {
+    const rows = msg.replyMarkup.rows.map((row) =>
+      row.buttons.map((btn: any): TgButton => ({
+        text: btn.text ?? "",
+        data: null,
+        url: btn.url ?? null,
+        webApp:
+          btn instanceof Api.KeyboardButtonWebView ||
+          btn instanceof Api.KeyboardButtonSimpleWebView,
+        // Only plain text buttons can be fulfilled by sending their text;
+        // request-phone/location/poll/webview variants can't, so leave them inert.
+        send: btn instanceof Api.KeyboardButton,
+      })),
+    );
+    return rows.length ? rows : null;
+  }
+  return null;
+}
+
+function extractReactions(msg: Api.Message): TgReaction[] | null {
+  const r = (msg as any).reactions;
+  if (!r?.results?.length) return null;
+  const out = (r.results as any[])
+    .filter((rc: any) => rc.reaction?.emoticon)
+    .map((rc: any) => ({
+      emoji: rc.reaction.emoticon as string,
+      count: rc.count as number,
+      mine: rc.chosenOrder !== undefined && rc.chosenOrder !== null,
+    }));
+  return out.length ? out : null;
+}
+
+function isStickerDoc(media: Api.TypeMessageMedia | null | undefined): boolean {
+  if (!(media instanceof Api.MessageMediaDocument)) return false;
+  const doc = (media as Api.MessageMediaDocument).document;
+  if (!(doc instanceof Api.Document)) return false;
+  return doc.attributes.some((a) => a instanceof Api.DocumentAttributeSticker);
+}
+
+// Filename of a document attachment, if the sender provided one.
+function docFileName(
+  media: Api.TypeMessageMedia | null | undefined,
+): string | null {
+  if (!(media instanceof Api.MessageMediaDocument)) return null;
+  const doc = (media as Api.MessageMediaDocument).document;
+  if (!(doc instanceof Api.Document)) return null;
+  const attr = doc.attributes.find(
+    (a) => a instanceof Api.DocumentAttributeFilename,
+  ) as Api.DocumentAttributeFilename | undefined;
+  return attr?.fileName ?? null;
+}
+
+async function resolveProxy(proxyId: string | null) {
+  if (!proxyId) return undefined;
+  try {
+    // SELECT value FROM settings WHERE key = 'proxies'
+    const value = await getSetting("proxies");
+    if (!value) return undefined;
+    const list: Array<{ id: string; url: string }> = JSON.parse(value);
+    return parseTgProxy(list.find((p) => p.id === proxyId)?.url);
+  } catch {
+    return undefined;
+  }
+}
+
+export async function reconnectClient(accountId: number): Promise<void> {
+  const entry = liveClients.get(accountId);
+  if (entry) {
+    try {
+      // destroy, not disconnect -- the old client is discarded for good
+      await entry.client.destroy();
+    } catch {
+      /* ignore */
+    }
+    liveClients.delete(accountId);
+  }
+  await getLiveClient(accountId);
+}
+
+const AUTH_ERROR_CODES = [
+  "AUTH_KEY_DUPLICATED",
+  "AUTH_KEY_INVALID",
+  "SESSION_REVOKED",
+  "SESSION_EXPIRED",
+  "USER_DEACTIVATED",
+  "USER_DEACTIVATED_BAN",
+];
+
+export function isAuthError(msg: string): boolean {
+  return AUTH_ERROR_CODES.some((code) => msg.includes(code));
+}
+
+// UPDATE tg_accounts SET auth_status = 'session_expired' WHERE id = ?
+export async function markSessionExpired(accountId: number): Promise<void> {
+  await updateAccount(accountId, { auth_status: "session_expired" });
+  const entry = liveClients.get(accountId);
+  if (entry) {
+    entry.client.destroy().catch(() => {});
+    liveClients.delete(accountId);
+  }
+}
+
+/**
+ * Connections in progress, so two callers asking for the same idle account share one.
+ *
+ * Without this there was a gap between the map lookup above and the `set` at the end: both
+ * callers saw no entry, both built and connected a TelegramClient, and the second overwrote
+ * the first in `liveClients`. The first was then live, connected and unreachable, running
+ * its update loop against Telegram until the process restarted.
+ */
+const connecting = new Map<number, Promise<LiveEntry>>();
+
+export async function getLiveClient(accountId: number): Promise<LiveEntry> {
+  const existing = liveClients.get(accountId);
+  if (existing) {
+    existing.lastActiveAt = Date.now();
+    if (!existing.client.connected) await existing.client.connect();
+    return existing;
+  }
+
+  const inFlight = connecting.get(accountId);
+  if (inFlight) return inFlight;
+
+  const pending = connectLiveClient(accountId);
+  connecting.set(accountId, pending);
+  try {
+    return await pending;
+  } finally {
+    // Cleared whether it resolved or threw, so a failed connect does not wedge the account
+    connecting.delete(accountId);
+  }
+}
+
+async function connectLiveClient(accountId: number): Promise<LiveEntry> {
+  let entry: LiveEntry | undefined;
+  // SELECT api_id, api_hash, session_string, proxy_id, app_client_id FROM tg_accounts WHERE id = ?
+  const account = (await col<AccountDoc>("tg_accounts").findOne(
+    { _id: accountId },
+    {
+      projection: {
+        api_id: 1,
+        api_hash: 1,
+        session_string: 1,
+        proxy_id: 1,
+        app_client_id: 1,
+      },
+    },
+  )) as AccountRow | null | undefined;
+  if (account) decryptAccountRow(account);
+
+  if (!account?.session_string)
+    throw new Error("Account not found or not authenticated");
+
+  const ownCredentials =
+    account.api_id && account.api_hash
+      ? { apiId: account.api_id, apiHash: account.api_hash }
+      : null;
+  const credentials = ownCredentials ?? (await getDefaultTgApiCredentials());
+  const apiId = credentials?.apiId;
+  const apiHash = credentials?.apiHash;
+  if (!apiId || !apiHash)
+    throw new Error("No API credentials available for this account");
+
+  const proxy = await resolveProxy(account.proxy_id);
+  const deviceParams = await resolveAppClientParams(
+    accountId,
+    account.app_client_id,
+  );
+
+  const client = new TelegramClient(
+    new StringSession(account.session_string),
+    apiId,
+    apiHash,
+    {
+      connectionRetries: 5,
+      baseLogger: new Logger(LogLevel.NONE),
+      ...(proxy ? { proxy } : {}),
+      ...(deviceParams ?? {}),
+    },
+  );
+
+  try {
+    await client.connect();
+  } catch (err: any) {
+    if (isAuthError(err?.message ?? "")) {
+      // UPDATE tg_accounts SET auth_status = 'session_expired' WHERE id = ?
+      await updateAccount(accountId, { auth_status: "session_expired" });
+    }
+    throw err;
+  }
+
+  // Invoke GetState so Telegram knows this session is active and starts pushing updates.
+  // Fire-and-forget -- we don't want to block the first HTTP request.
+  client.invoke(new Api.updates.GetState()).catch(() => {});
+
+  entry = {
+    client,
+    entityCache: new Map(),
+    subscribers: new Set(),
+    dialogSubscribers: new Set(),
+    avatarCache: new Map(),
+    readOutboxCache: new Map(),
+    readSubscribers: new Set(),
+    typingSubscribers: new Set(),
+    lastActiveAt: Date.now(),
+  };
+  liveClients.set(accountId, entry);
+  evictSurplusClients(accountId);
+
+  client.addEventHandler(async (event: NewMessageEvent) => {
+    const msg = event.message as Api.Message;
+    if (!msg?.peerId) return;
+
+    const chatId = peerToChatId(msg.peerId);
+    if (!chatId) return;
+
+    let fromName: string | null = null;
+    if (msg.fromId) {
+      const fid = peerToChatId(msg.fromId as Api.TypePeer);
+      const sender = entry!.entityCache.get(fid);
+      if (sender) fromName = entityName(sender);
+    }
+
+    const liveMsg: TgLiveMessage = {
+      chatId,
+      message: {
+        id: msg.id,
+        text: msg.message ?? "",
+        html: entitiesToHtml(msg.message ?? "", msg.entities),
+        date: msg.date,
+        fromMe: Boolean(msg.out),
+        isRead: false, // freshly received -- recipient hasn't read it yet
+        fromId: msg.fromId ? peerToChatId(msg.fromId as Api.TypePeer) : null,
+        fromName,
+        hasPhoto: msg.media instanceof Api.MessageMediaPhoto,
+        hasDocument:
+          msg.media instanceof Api.MessageMediaDocument &&
+          !isStickerDoc(msg.media),
+        hasSticker: isStickerDoc(msg.media),
+        fileName: docFileName(msg.media),
+        buttons: extractButtons(msg),
+        reactions: extractReactions(msg),
+        replyToId: (msg.replyTo as any)?.replyToMsgId ?? null,
+        replyToText: null,
+        replyToName: null,
+        replyCount: (msg as any).replies?.replies ?? null,
+      },
+    };
+
+    await cacheMessages(accountId, chatId, [liveMsg.message]);
+    // Subscribers stay synchronous: the payload is complete before this point, so
+    // awaiting the cache write above alone preserves the previous push semantics.
+    entry!.subscribers.forEach((sub) => sub(liveMsg));
+  }, new NewMessage({}));
+
+  // Update read status when the recipient reads our outgoing messages (1-to-1 / group chats)
+  client.addEventHandler(
+    (update: Api.UpdateReadHistoryOutbox) => {
+      const chatId = peerToChatId(update.peer);
+      if (!chatId) return;
+      entry!.readOutboxCache.set(chatId, update.maxId);
+      entry!.readSubscribers.forEach((sub) => sub(chatId, update.maxId));
+    },
+    new Raw({ types: [Api.UpdateReadHistoryOutbox] }),
+  );
+
+  // Update read status for channel outbox reads
+  client.addEventHandler(
+    (update: Api.UpdateReadChannelOutbox) => {
+      const chatId = `c${update.channelId.toString()}`;
+      entry!.readOutboxCache.set(chatId, update.maxId);
+      entry!.readSubscribers.forEach((sub) => sub(chatId, update.maxId));
+    },
+    new Raw({ types: [Api.UpdateReadChannelOutbox] }),
+  );
+
+  // Typing notifications for private chats, basic groups and supergroups
+  const emitTyping = (
+    chatId: string,
+    fromId: string | null,
+    action: Api.TypeSendMessageAction,
+  ) => {
+    let userName: string | null = null;
+    if (fromId) {
+      const sender = entry!.entityCache.get(fromId);
+      if (sender) userName = entityName(sender);
+    }
+    entry!.typingSubscribers.forEach((sub) =>
+      sub({
+        chatId,
+        userId: fromId,
+        userName,
+        cancelled: action instanceof Api.SendMessageCancelAction,
+      }),
+    );
+  };
+
+  client.addEventHandler(
+    (update: Api.UpdateUserTyping) => {
+      const uid = `u${update.userId.toString()}`;
+      emitTyping(uid, uid, update.action);
+    },
+    new Raw({ types: [Api.UpdateUserTyping] }),
+  );
+
+  client.addEventHandler(
+    (update: Api.UpdateChatUserTyping) => {
+      emitTyping(
+        `g${update.chatId.toString()}`,
+        update.fromId ? peerToChatId(update.fromId) : null,
+        update.action,
+      );
+    },
+    new Raw({ types: [Api.UpdateChatUserTyping] }),
+  );
+
+  client.addEventHandler(
+    (update: Api.UpdateChannelUserTyping) => {
+      emitTyping(
+        `c${update.channelId.toString()}`,
+        update.fromId ? peerToChatId(update.fromId) : null,
+        update.action,
+      );
+    },
+    new Raw({ types: [Api.UpdateChannelUserTyping] }),
+  );
+
+  return entry;
+}
+
+// Load all dialogs into the entity cache
+export async function loadDialogs(
+  entry: LiveEntry,
+  limit = 200,
+): Promise<TgDialogItem[]> {
+  const dialogs = await entry.client.getDialogs({ limit });
+  const result: TgDialogItem[] = [];
+
+  for (const d of dialogs) {
+    if (!d.entity) continue;
+    const entity = d.entity as Api.User | Api.Chat | Api.Channel;
+    const chatId = entityToChatId(entity);
+    entry.entityCache.set(chatId, entity);
+    const roMaxId = (d.dialog as any).readOutboxMaxId as number | undefined;
+    if (roMaxId) entry.readOutboxCache.set(chatId, roMaxId);
+
+    const type: TgDialogItem["type"] =
+      entity instanceof Api.User
+        ? entity.bot
+          ? "bot"
+          : "user"
+        : entity instanceof Api.Channel
+          ? entity.megagroup
+            ? "group"
+            : "channel"
+          : "group";
+
+    const lastMsg = d.message as Api.Message | undefined;
+    const muteUntil = (d.dialog as any).notifySettings?.muteUntil ?? 0;
+    const muted = muteUntil > 0 && muteUntil > Math.floor(Date.now() / 1000);
+    const pinned = Boolean((d.dialog as any).pinned);
+    result.push({
+      chatId,
+      name: d.name ?? entityName(entity),
+      type,
+      username: (entity as any).username ?? null,
+      unreadCount: d.dialog.unreadCount ?? 0,
+      lastMessage: lastMsg
+        ? {
+            text: lastMsg.message ?? "",
+            date: lastMsg.date,
+            fromMe: Boolean(lastMsg.out),
+          }
+        : null,
+      muted,
+      pinned,
+    });
+  }
+
+  return result;
+}
+
+export async function ensureEntityCached(
+  entry: LiveEntry,
+  chatId: string,
+): Promise<void> {
+  if (entry.entityCache.has(chatId)) return;
+  await loadDialogs(entry);
+  if (entry.entityCache.has(chatId)) return;
+  // Fallback for group members not in the user's dialogs (e.g. other participants).
+  // GramJS keeps these in its internal session store after messages are fetched,
+  // so getEntity resolves them without an extra network round-trip in most cases.
+  try {
+    const peer = chatIdToPeer(chatId);
+    if (peer) {
+      const entity = (await entry.client.getEntity(peer)) as
+        Api.User | Api.Chat | Api.Channel;
+      if (entity) entry.entityCache.set(chatId, entity);
+    }
+  } catch {
+    /* not resolvable -- fetchAvatar will cache null and won't retry */
+  }
+}
+
+export async function getMessages(
+  entry: LiveEntry,
+  chatId: string,
+  limit: number,
+  offsetId: number,
+  search?: string,
+): Promise<TgMsgPayload[]> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found -- open the dialogs list first");
+
+  // Service messages (join/leave/pin announcements) are dropped, so keep fetching
+  // until a full page of real messages is collected. Returning a short page would
+  // make the frontend believe history is exhausted and stop paginating.
+  const msgs: Api.Message[] = [];
+  let cursor = offsetId;
+  for (let hop = 0; hop < 5 && msgs.length < limit; hop++) {
+    const batch = await entry.client.getMessages(entity, {
+      limit,
+      ...(cursor ? { offsetId: cursor } : {}),
+      ...(search ? { search } : {}),
+    });
+    if (!batch.length) break;
+    for (const m of batch) {
+      if (m instanceof Api.Message && msgs.length < limit) msgs.push(m);
+    }
+    cursor = batch[batch.length - 1].id;
+    if (batch.length < limit) break; // genuine end of history
+  }
+
+  // Batch-fetch reply-to message texts for quote display
+  const replyIdSet = new Set<number>();
+  for (const msg of msgs) {
+    const rt = (msg as any).replyTo;
+    if (rt?.className === "MessageReplyHeader" && rt.replyToMsgId) {
+      replyIdSet.add(rt.replyToMsgId as number);
+    }
+  }
+  const replyMap = new Map<number, { text: string; name: string | null }>();
+  if (replyIdSet.size > 0) {
+    try {
+      const replyMsgs = await entry.client.getMessages(entity, {
+        ids: [...replyIdSet],
+      });
+      for (const rm of replyMsgs) {
+        if (!rm?.id) continue;
+        let rname: string | null = null;
+        if (rm.fromId) {
+          const rfid = peerToChatId(rm.fromId as Api.TypePeer);
+          const rsender = entry.entityCache.get(rfid);
+          if (rsender) rname = entityName(rsender);
+        }
+        replyMap.set(rm.id, { text: rm.message ?? "", name: rname });
+      }
+    } catch {
+      // Best effort -- reply quotes may be missing
+    }
+  }
+
+  return msgs.map((msg) => {
+    let fromName: string | null = null;
+    if (msg.fromId) {
+      const fid = peerToChatId(msg.fromId as Api.TypePeer);
+      const sender = entry.entityCache.get(fid);
+      if (sender) fromName = entityName(sender);
+    }
+    const rt = (msg as any).replyTo;
+    const replyToId =
+      rt?.className === "MessageReplyHeader" ? (rt.replyToMsgId ?? null) : null;
+    const replyInfo = replyToId ? replyMap.get(replyToId) : undefined;
+    const readMaxId = entry.readOutboxCache.get(chatId) ?? 0;
+    return {
+      id: msg.id,
+      text: msg.message ?? "",
+      html: entitiesToHtml(msg.message ?? "", (msg as Api.Message).entities),
+      date: msg.date,
+      fromMe: Boolean(msg.out),
+      isRead: Boolean(msg.out) && msg.id <= readMaxId,
+      fromId: msg.fromId ? peerToChatId(msg.fromId as Api.TypePeer) : null,
+      fromName,
+      hasPhoto: msg.media instanceof Api.MessageMediaPhoto,
+      hasDocument:
+        msg.media instanceof Api.MessageMediaDocument &&
+        !isStickerDoc(msg.media),
+      hasSticker: isStickerDoc(msg.media),
+      fileName: docFileName(msg.media),
+      buttons: extractButtons(msg as Api.Message),
+      reactions: extractReactions(msg as Api.Message),
+      replyToId,
+      replyToText: replyInfo?.text ?? null,
+      replyToName: replyInfo?.name ?? null,
+      replyCount: (msg as any).replies?.replies ?? null,
+    };
+  });
+}
+
+export async function getPinnedMessage(
+  entry: LiveEntry,
+  chatId: string,
+): Promise<TgMsgPayload | null> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+
+  let pinnedMsgId: number | null = null;
+
+  if (entity instanceof Api.Channel) {
+    const result = await entry.client.invoke(
+      new Api.channels.GetFullChannel({ channel: entity as any }),
+    );
+    pinnedMsgId = (result.fullChat as any).pinnedMsgId ?? null;
+  } else if (entity instanceof Api.Chat) {
+    const result = await entry.client.invoke(
+      new Api.messages.GetFullChat({ chatId: (entity as Api.Chat).id as any }),
+    );
+    pinnedMsgId = (result.fullChat as any).pinnedMsgId ?? null;
+  }
+
+  if (!pinnedMsgId) return null;
+
+  const msgs = await entry.client.getMessages(entity, { ids: [pinnedMsgId] });
+  if (!msgs.length || !msgs[0]) return null;
+
+  const msg = msgs[0] as Api.Message;
+  const readMaxId = entry.readOutboxCache.get(chatId) ?? 0;
+  return {
+    id: msg.id,
+    text: msg.message ?? "",
+    html: entitiesToHtml(msg.message ?? "", (msg as Api.Message).entities),
+    date: msg.date,
+    fromMe: Boolean(msg.out),
+    isRead: Boolean(msg.out) && msg.id <= readMaxId,
+    fromId: msg.fromId ? peerToChatId(msg.fromId as Api.TypePeer) : null,
+    fromName: null,
+    hasPhoto: msg.media instanceof Api.MessageMediaPhoto,
+    hasDocument:
+      msg.media instanceof Api.MessageMediaDocument && !isStickerDoc(msg.media),
+    hasSticker: isStickerDoc(msg.media),
+    fileName: docFileName(msg.media),
+    buttons: extractButtons(msg),
+    reactions: null,
+    replyToId: null,
+    replyToText: null,
+    replyToName: null,
+    replyCount: null,
+  };
+}
+
+export async function sendMessage(
+  entry: LiveEntry,
+  chatId: string,
+  text: string,
+  replyToMsgId?: number,
+): Promise<{ id: number; date: number }> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+
+  const result = await entry.client.sendMessage(entity, {
+    message: text,
+    parseMode: false, // disable markdown so characters like __ are sent verbatim
+    ...(replyToMsgId ? { replyTo: replyToMsgId } : {}),
+  });
+  return { id: result.id, date: result.date };
+}
+
+export async function sendFile(
+  entry: LiveEntry,
+  chatId: string,
+  opts: {
+    buffer: Buffer;
+    filename: string;
+    caption?: string;
+    forceDocument?: boolean;
+    replyToMsgId?: number;
+  },
+): Promise<{ id: number; date: number; hasPhoto: boolean; hasDocument: boolean }> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+
+  const toUpload = new CustomFile(
+    opts.filename,
+    opts.buffer.length,
+    "",
+    opts.buffer,
+  );
+  const result = await entry.client.sendFile(entity, {
+    file: toUpload,
+    caption: opts.caption,
+    forceDocument: opts.forceDocument,
+    ...(opts.replyToMsgId ? { replyTo: opts.replyToMsgId } : {}),
+  });
+  // Telegram sends images without forceDocument as photos, everything else as documents.
+  const hasPhoto = result.photo != null;
+  return {
+    id: result.id,
+    date: result.date,
+    hasPhoto,
+    hasDocument: !hasPhoto,
+  };
+}
+
+export async function getContacts(entry: LiveEntry): Promise<TgContactItem[]> {
+  const result = await entry.client.invoke(
+    new Api.contacts.GetContacts({ hash: BigInt(0) as any }),
+  );
+  if (!("users" in result)) return [];
+
+  return (result.users as Api.User[])
+    .filter((u) => !u.deleted)
+    .map((u) => {
+      const chatId = entityToChatId(u);
+      entry.entityCache.set(chatId, u);
+      return {
+        chatId,
+        firstName: u.firstName ?? "",
+        lastName: u.lastName ?? "",
+        username: u.username ?? null,
+        phone: u.phone ?? null,
+      };
+    });
+}
+
+export async function addContact(
+  entry: LiveEntry,
+  phone: string,
+  firstName: string,
+  lastName = "",
+): Promise<TgContactItem | null> {
+  const result = await entry.client.invoke(
+    new Api.contacts.ImportContacts({
+      contacts: [
+        new Api.InputPhoneContact({
+          clientId: BigInt(Date.now() % 1_000_000) as any,
+          phone,
+          firstName,
+          lastName,
+        }),
+      ],
+    }),
+  );
+
+  const user = (result.users as Api.User[])[0];
+  if (!user) return null;
+
+  const chatId = entityToChatId(user);
+  entry.entityCache.set(chatId, user);
+  return {
+    chatId,
+    firstName: user.firstName ?? "",
+    lastName: user.lastName ?? "",
+    username: user.username ?? null,
+    phone: user.phone ?? null,
+  };
+}
+
+export async function editContact(
+  entry: LiveEntry,
+  chatId: string,
+  firstName: string,
+  lastName = "",
+): Promise<TgContactItem | null> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!(entity instanceof Api.User)) return null;
+
+  // ImportContacts updates an existing contact when the user is already known
+  const result = await entry.client.invoke(
+    new Api.contacts.ImportContacts({
+      contacts: [
+        new Api.InputPhoneContact({
+          clientId: BigInt(Date.now() % 1_000_000) as any,
+          phone: (entity as any).phone ?? "",
+          firstName,
+          lastName,
+        }),
+      ],
+    }),
+  );
+
+  const updated = ((result as any).users as Api.User[])[0] ?? entity;
+  entry.entityCache.set(chatId, updated);
+  return {
+    chatId,
+    firstName: (updated as any).firstName ?? "",
+    lastName: (updated as any).lastName ?? "",
+    username: (updated as any).username ?? null,
+    phone: (updated as any).phone ?? null,
+  };
+}
+
+// Full dialog list for name matching. Telegram's contacts.Search only matches
+// username substrings reliably (titles, especially CJK ones, are often missed),
+// so own chats must be matched locally the way official clients do. Cached for
+// 60s per account to keep per-keystroke searches off the network.
+const DIALOG_SEARCH_CACHE_MS = 60_000;
+const DIALOG_SEARCH_LIMIT = 1000;
+
+async function searchableDialogs(entry: LiveEntry): Promise<TgDialogItem[]> {
+  const cached = entry.dialogSearchCache;
+  if (cached && Date.now() - cached.ts < DIALOG_SEARCH_CACHE_MS) {
+    return cached.items;
+  }
+  const items = await loadDialogs(entry, DIALOG_SEARCH_LIMIT);
+  entry.dialogSearchCache = { ts: Date.now(), items };
+  return items;
+}
+
+function entityToDialogItem(
+  entity: Api.User | Api.Chat | Api.Channel,
+): TgDialogItem {
+  if (entity instanceof Api.User) {
+    return {
+      chatId: entityToChatId(entity),
+      name: entityName(entity),
+      type: entity.bot ? "bot" : "user",
+      username: entity.username ?? null,
+      unreadCount: 0,
+      lastMessage: null,
+    };
+  }
+  return {
+    chatId: entityToChatId(entity),
+    name: entityName(entity),
+    type:
+      entity instanceof Api.Channel
+        ? entity.megagroup
+          ? "group"
+          : "channel"
+        : "group",
+    username: (entity as any).username ?? null,
+    unreadCount: 0,
+    lastMessage: null,
+    left: entity instanceof Api.Channel ? Boolean(entity.left) : false,
+  };
+}
+
+export async function searchPeers(
+  entry: LiveEntry,
+  query: string,
+): Promise<TgDialogItem[]> {
+  const q = query.toLowerCase();
+  const seen = new Set<string>();
+  const dialogMatches: TgDialogItem[] = [];
+  const titleMatches: TgDialogItem[] = [];
+  const globalMatches: TgDialogItem[] = [];
+  const messageMatches: TgDialogItem[] = [];
+
+  // The server matches strictly, so a query with extra trailing tokens (e.g.
+  // "... v3") can return nothing while a shorter prefix matches -- retry with
+  // trailing words dropped when a search comes back empty.
+  const words = query.split(/\s+/).filter(Boolean);
+  const attempts = [query];
+  for (let n = words.length - 1; n >= 1 && attempts.length < 3; n--) {
+    const sub = words.slice(0, n).join(" ");
+    if (sub && sub !== query) attempts.push(sub);
+  }
+
+  // 1. Own chats by title/username substring across the full dialog list --
+  // covers private groups and CJK titles the server-side search cannot find
+  try {
+    for (const d of await searchableDialogs(entry)) {
+      if (
+        d.name.toLowerCase().includes(q) ||
+        d.username?.toLowerCase().includes(q)
+      ) {
+        if (!seen.has(d.chatId)) {
+          seen.add(d.chatId);
+          dialogMatches.push(d);
+        }
+      }
+    }
+  } catch {
+    // Dialog fetch failed (e.g. flood wait) -- server searches below still run
+  }
+
+  // 2. Global message search -- the server also matches chats by TITLE here,
+  // which is how official clients find member chats that are no longer in the
+  // dialog list (e.g. removed/archived) and have no username
+  for (const attempt of attempts) {
+    let result: Api.messages.TypeMessages;
+    try {
+      result = await entry.client.invoke(
+        new Api.messages.SearchGlobal({
+          q: attempt,
+          filter: new Api.InputMessagesFilterEmpty(),
+          minDate: 0,
+          maxDate: 0,
+          offsetRate: 0,
+          offsetPeer: new Api.InputPeerEmpty(),
+          offsetId: 0,
+          limit: 20,
+        }),
+      );
+    } catch {
+      continue;
+    }
+
+    const msgs = ((result as any).messages ?? []) as Api.TypeMessage[];
+    const entities = new Map<string, Api.User | Api.Chat | Api.Channel>();
+    for (const c of ((result as any).chats ?? []) as (Api.Chat | Api.Channel)[]) {
+      entities.set(entityToChatId(c), c);
+    }
+    for (const u of ((result as any).users ?? []) as Api.User[]) {
+      entities.set(entityToChatId(u), u);
+    }
+
+    // The server title-matches chats and returns them in the entity list even
+    // when none of the matched messages belong to them (e.g. a group the user
+    // left) -- surface those first, they are what the user is looking for
+    const attemptLc = attempt.toLowerCase();
+    for (const [chatId, ent] of entities) {
+      if (seen.has(chatId) || ent instanceof Api.User) continue;
+      if ((ent as any).deactivated || (ent as any).forbidden) continue;
+      const item = entityToDialogItem(ent);
+      const name = item.name.toLowerCase();
+      if (name.includes(q) || name.includes(attemptLc)) {
+        seen.add(chatId);
+        entry.entityCache.set(chatId, ent);
+        titleMatches.push(item);
+      }
+    }
+
+    for (const m of msgs) {
+      if (!(m instanceof Api.Message) || !m.peerId) continue;
+      const chatId = peerToChatId(m.peerId);
+      if (seen.has(chatId)) continue;
+      const ent = entities.get(chatId);
+      if (!ent) continue;
+      if ((ent as any).deactivated || (ent as any).forbidden) continue;
+      seen.add(chatId);
+      entry.entityCache.set(chatId, ent);
+      const item = entityToDialogItem(ent);
+      item.lastMessage = {
+        text: m.message ?? "",
+        date: m.date,
+        fromMe: Boolean(m.out),
+      };
+      // A mere mention in some message text ranks last
+      messageMatches.push(item);
+    }
+
+    if (msgs.length > 0 || titleMatches.length > 0) break;
+  }
+
+  // 3. Global search for public chats/users by username
+  for (const attempt of attempts) {
+    let result: Api.contacts.TypeFound;
+    try {
+      result = await entry.client.invoke(
+        new Api.contacts.Search({ q: attempt, limit: 20 }),
+      );
+    } catch {
+      continue; // e.g. QUERY_TOO_SHORT on a shortened attempt
+    }
+
+    let found = false;
+
+    for (const u of result.users as Api.User[]) {
+      if (u.deleted) continue;
+      found = true;
+      const chatId = entityToChatId(u);
+      if (seen.has(chatId)) continue;
+      seen.add(chatId);
+      entry.entityCache.set(chatId, u);
+      globalMatches.push(entityToDialogItem(u));
+    }
+
+    for (const c of result.chats as (Api.Chat | Api.Channel)[]) {
+      if ((c as any).deactivated || (c as any).forbidden) continue;
+      found = true;
+      const chatId = entityToChatId(c as Api.Chat | Api.Channel);
+      if (seen.has(chatId)) continue;
+      seen.add(chatId);
+      entry.entityCache.set(chatId, c as Api.Chat | Api.Channel);
+      globalMatches.push(entityToDialogItem(c as Api.Chat | Api.Channel));
+    }
+
+    if (found) break;
+  }
+
+  return [
+    ...dialogMatches,
+    ...titleMatches,
+    ...globalMatches,
+    ...messageMatches,
+  ];
+}
+
+export async function fetchPhoto(
+  entry: LiveEntry,
+  chatId: string,
+  msgId: number,
+): Promise<{ buf: Buffer; mimeType: string } | null> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) return null;
+
+  const [msg] = await entry.client.getMessages(entity, { ids: [msgId] });
+  if (!msg?.media) return null;
+
+  let mimeType = "image/jpeg";
+  if (msg.media instanceof Api.MessageMediaDocument) {
+    const doc = (msg.media as Api.MessageMediaDocument).document;
+    if (doc instanceof Api.Document) {
+      if (doc.mimeType) mimeType = doc.mimeType;
+      const size = Number(doc.size ?? 0);
+      if (size > MEDIA_MAX_BYTES) {
+        console.warn(
+          `[tg] Refusing ${(size / 1048576).toFixed(0)}MB media in ${chatId}: over the ${(MEDIA_MAX_BYTES / 1048576).toFixed(0)}MB inline limit (TG_MEDIA_MAX_MB)`,
+        );
+        return null;
+      }
+    }
+  }
+
+  const data = await entry.client.downloadMedia(msg, {});
+  if (!data) return null;
+  let buf: Buffer;
+  if (Buffer.isBuffer(data)) buf = data;
+  else if (typeof data === "string") buf = Buffer.from(data, "binary");
+  else buf = Buffer.from(data as Uint8Array);
+  return { buf, mimeType };
+}
+
+export async function fetchAvatar(
+  entry: LiveEntry,
+  chatId: string,
+): Promise<Buffer | null> {
+  if (entry.avatarCache.has(chatId)) return entry.avatarCache.get(chatId)!;
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) {
+    entry.avatarCache.set(chatId, null);
+    return null;
+  }
+  try {
+    // isBig must be provided -- GramJS throws TypeError if fileParams is undefined
+    const data = await entry.client.downloadProfilePhoto(
+      entity as any,
+      { isBig: false } as any,
+    );
+    if (!data || (Buffer.isBuffer(data) && data.length === 0)) {
+      entry.avatarCache.set(chatId, null);
+      return null;
+    }
+    const buf = Buffer.isBuffer(data)
+      ? data
+      : Buffer.from(data as unknown as Uint8Array);
+    entry.avatarCache.set(chatId, buf);
+    return buf;
+  } catch {
+    entry.avatarCache.set(chatId, null);
+    return null;
+  }
+}
+
+// Fetch multiple avatars with bounded concurrency (10 at a time).
+// Returns a map of chatId -> base64 jpeg string for chats that have an avatar.
+export async function fetchAvatarsBatch(
+  entry: LiveEntry,
+  chatIds: string[],
+): Promise<Record<string, string>> {
+  const result: Record<string, string> = {};
+  const CONCURRENCY = 10;
+  for (let i = 0; i < chatIds.length; i += CONCURRENCY) {
+    await Promise.all(
+      chatIds.slice(i, i + CONCURRENCY).map(async (chatId) => {
+        const buf = await fetchAvatar(entry, chatId);
+        if (buf) result[chatId] = buf.toString("base64");
+      }),
+    );
+  }
+  return result;
+}
+
+export type TgProfileInfo = {
+  chatId: string;
+  /** The ID as Telegram clients and bots show it, which is what a job's chat field takes. */
+  peerId: string;
+  name: string;
+  type: "user" | "bot" | "group" | "channel";
+  username: string | null;
+  phone: string | null;
+  bio: string | null;
+  memberCount: number | null;
+  firstName: string | null;
+  lastName: string | null;
+  blocked: boolean | null;
+};
+
+export async function getEntityDetails(
+  entry: LiveEntry,
+  chatId: string,
+): Promise<TgProfileInfo> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Entity not found");
+
+  const type: TgProfileInfo["type"] =
+    entity instanceof Api.User
+      ? (entity as any).bot
+        ? "bot"
+        : "user"
+      : entity instanceof Api.Channel
+        ? (entity as any).megagroup
+          ? "group"
+          : "channel"
+        : "group";
+
+  let bio: string | null = null;
+  let memberCount: number | null = null;
+  let blocked: boolean | null = null;
+
+  try {
+    if (entity instanceof Api.User) {
+      const full = await entry.client.invoke(
+        new Api.users.GetFullUser({ id: entity as any }),
+      );
+      bio = (full as any).fullUser?.about ?? null;
+      blocked = Boolean((full as any).fullUser?.blocked);
+    } else if (entity instanceof Api.Channel) {
+      const full = await entry.client.invoke(
+        new Api.channels.GetFullChannel({ channel: entity as any }),
+      );
+      bio = (full as any).fullChat?.about ?? null;
+      memberCount = (full as any).fullChat?.participantsCount ?? null;
+    } else {
+      const full = await entry.client.invoke(
+        new Api.messages.GetFullChat({ chatId: (entity as any).id as any }),
+      );
+      bio = (full as any).fullChat?.about ?? null;
+      memberCount =
+        (full as any).fullChat?.participants?.participants?.length ?? null;
+    }
+  } catch {
+    // Full details unavailable -- basic info from entity cache is still returned
+  }
+
+  const isUser = entity instanceof Api.User;
+  return {
+    chatId,
+    peerId: displayPeerId(chatId),
+    name: entityName(entity),
+    type,
+    username: (entity as any).username ?? null,
+    phone: (entity as any).phone ?? null,
+    bio,
+    memberCount,
+    firstName: isUser ? ((entity as Api.User).firstName ?? null) : null,
+    lastName: isUser ? ((entity as Api.User).lastName ?? null) : null,
+    blocked,
+  };
+}
+
+// Block or unblock a user (contacts.Block / contacts.Unblock)
+export async function setBlocked(
+  entry: LiveEntry,
+  chatId: string,
+  blocked: boolean,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!(entity instanceof Api.User))
+    throw new Error("Only users and bots can be blocked");
+  if (blocked) {
+    await entry.client.invoke(new Api.contacts.Block({ id: entity as any }));
+  } else {
+    await entry.client.invoke(new Api.contacts.Unblock({ id: entity as any }));
+  }
+}
+
+export type TgReportReason =
+  | "spam"
+  | "violence"
+  | "pornography"
+  | "childAbuse"
+  | "illegalDrugs"
+  | "personalDetails"
+  | "fake"
+  | "copyright"
+  | "other";
+
+const REPORT_REASON_MAP: Record<TgReportReason, () => Api.TypeReportReason> = {
+  spam: () => new Api.InputReportReasonSpam(),
+  violence: () => new Api.InputReportReasonViolence(),
+  pornography: () => new Api.InputReportReasonPornography(),
+  childAbuse: () => new Api.InputReportReasonChildAbuse(),
+  illegalDrugs: () => new Api.InputReportReasonIllegalDrugs(),
+  personalDetails: () => new Api.InputReportReasonPersonalDetails(),
+  fake: () => new Api.InputReportReasonFake(),
+  copyright: () => new Api.InputReportReasonCopyright(),
+  other: () => new Api.InputReportReasonOther(),
+};
+
+// Report a user, group or channel to Telegram
+export async function reportPeer(
+  entry: LiveEntry,
+  chatId: string,
+  reason: TgReportReason,
+  comment = "",
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  const makeReason = REPORT_REASON_MAP[reason];
+  if (!makeReason) throw new Error("Unknown report reason");
+  await entry.client.invoke(
+    new Api.account.ReportPeer({
+      peer: entity as any,
+      reason: makeReason(),
+      message: comment,
+    }),
+  );
+}
+
+// Delete chat history. revoke=true also removes it for the other side
+// (private chats only). Channels/supergroups clear the local copy only.
+export async function deleteHistory(
+  entry: LiveEntry,
+  chatId: string,
+  revoke: boolean,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  if (entity instanceof Api.Channel) {
+    await entry.client.invoke(
+      new Api.channels.DeleteHistory({ channel: entity as any, maxId: 0 }),
+    );
+  } else {
+    await entry.client.invoke(
+      new Api.messages.DeleteHistory({
+        peer: entity as any,
+        maxId: 0,
+        revoke,
+      }),
+    );
+  }
+}
+
+// Delete specific messages. revoke=true deletes for everyone
+// (channel/supergroup deletes are always for everyone).
+export async function deleteMessages(
+  entry: LiveEntry,
+  chatId: string,
+  ids: number[],
+  revoke: boolean,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  if (entity instanceof Api.Channel) {
+    await entry.client.invoke(
+      new Api.channels.DeleteMessages({ channel: entity as any, id: ids }),
+    );
+  } else {
+    await entry.client.invoke(
+      new Api.messages.DeleteMessages({ id: ids, revoke }),
+    );
+  }
+}
+
+// Edit the text of an own message
+export async function editMessage(
+  entry: LiveEntry,
+  chatId: string,
+  msgId: number,
+  text: string,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  await entry.client.invoke(
+    new Api.messages.EditMessage({
+      peer: entity as any,
+      id: msgId,
+      message: text,
+    }),
+  );
+}
+
+// Broadcast that this account is typing in a chat (auto-expires after ~6s)
+export async function sendTyping(
+  entry: LiveEntry,
+  chatId: string,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  await entry.client.invoke(
+    new Api.messages.SetTyping({
+      peer: entity as any,
+      action: new Api.SendMessageTypingAction(),
+    }),
+  );
+}
+
+// Forward messages to another chat
+export async function forwardMessages(
+  entry: LiveEntry,
+  fromChatId: string,
+  toChatId: string,
+  ids: number[],
+): Promise<void> {
+  await ensureEntityCached(entry, fromChatId);
+  await ensureEntityCached(entry, toChatId);
+  const fromEntity = entry.entityCache.get(fromChatId);
+  const toEntity = entry.entityCache.get(toChatId);
+  if (!fromEntity || !toEntity) throw new Error("Chat not found");
+  await entry.client.forwardMessages(toEntity, {
+    messages: ids,
+    fromPeer: fromEntity,
+  });
+}
+
+export type TgFolderItem = {
+  id: number;
+  title: string;
+  emoticon: string | null;
+  includeGroups: boolean;
+  includeBroadcasts: boolean;
+  includeBots: boolean;
+  includeContacts: boolean;
+  includeNonContacts: boolean;
+  pinnedChatIds: string[];
+  includedChatIds: string[];
+  excludedChatIds: string[];
+};
+
+// Convert an InputPeer (from DialogFilter peer lists) to chatId format
+function inputPeerToChatId(peer: any): string {
+  if (!peer) return "";
+  if (peer.userId !== undefined) return `u${peer.userId}`;
+  if (peer.channelId !== undefined) return `c${peer.channelId}`;
+  if (peer.chatId !== undefined) return `g${peer.chatId}`;
+  return "";
+}
+
+// Mute a dialog -- pass muteSecs=0 to unmute
+export async function muteDialog(
+  entry: LiveEntry,
+  chatId: string,
+  muteSecs: number,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Entity not found");
+
+  let peer: any;
+  if (entity instanceof Api.User) {
+    peer = new Api.InputNotifyPeer({
+      peer: new Api.InputPeerUser({
+        userId: (entity as any).id,
+        accessHash: (entity as any).accessHash ?? (BigInt(0) as any),
+      }),
+    });
+  } else if (entity instanceof Api.Channel) {
+    peer = new Api.InputNotifyPeer({
+      peer: new Api.InputPeerChannel({
+        channelId: (entity as any).id,
+        accessHash: (entity as any).accessHash ?? (BigInt(0) as any),
+      }),
+    });
+  } else {
+    peer = new Api.InputNotifyPeer({
+      peer: new Api.InputPeerChat({ chatId: (entity as any).id as any }),
+    });
+  }
+
+  await entry.client.invoke(
+    new Api.account.UpdateNotifySettings({
+      peer,
+      settings: new Api.InputPeerNotifySettings({
+        muteUntil:
+          muteSecs === 0 ? 0 : Math.floor(Date.now() / 1000) + muteSecs,
+      }),
+    }),
+  );
+}
+
+// Pin or unpin a dialog in the user's dialog list
+export async function pinDialog(
+  entry: LiveEntry,
+  chatId: string,
+  pinned: boolean,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Entity not found");
+
+  let peer: any;
+  if (entity instanceof Api.User) {
+    peer = new Api.InputDialogPeer({
+      peer: new Api.InputPeerUser({
+        userId: (entity as any).id,
+        accessHash: (entity as any).accessHash ?? (BigInt(0) as any),
+      }),
+    });
+  } else if (entity instanceof Api.Channel) {
+    peer = new Api.InputDialogPeer({
+      peer: new Api.InputPeerChannel({
+        channelId: (entity as any).id,
+        accessHash: (entity as any).accessHash ?? (BigInt(0) as any),
+      }),
+    });
+  } else {
+    peer = new Api.InputDialogPeer({
+      peer: new Api.InputPeerChat({ chatId: (entity as any).id as any }),
+    });
+  }
+
+  await entry.client.invoke(new Api.messages.ToggleDialogPin({ peer, pinned }));
+}
+
+export async function getFolders(entry: LiveEntry): Promise<TgFolderItem[]> {
+  try {
+    const raw = await entry.client.invoke(new Api.messages.GetDialogFilters());
+    // Older layers return a plain array; newer layers wrap in { filters: [...] }
+    const filters: any[] = Array.isArray(raw)
+      ? raw
+      : ((raw as any)?.filters ?? []);
+
+    return filters
+      .filter((f: any) => f.id && f.title !== undefined)
+      .map((f: any) => ({
+        id: f.id as number,
+        title:
+          typeof f.title === "string" ? f.title : (f.title?.text ?? "Folder"),
+        emoticon: (f.emoticon as string | undefined) ?? null,
+        includeGroups: Boolean(f.groups),
+        includeBroadcasts: Boolean(f.broadcasts),
+        includeBots: Boolean(f.bots),
+        includeContacts: Boolean(f.contacts),
+        includeNonContacts: Boolean(f.nonContacts),
+        pinnedChatIds: ((f.pinnedPeers ?? []) as any[])
+          .map(inputPeerToChatId)
+          .filter(Boolean),
+        includedChatIds: ((f.includePeers ?? []) as any[])
+          .map(inputPeerToChatId)
+          .filter(Boolean),
+        excludedChatIds: ((f.excludePeers ?? []) as any[])
+          .map(inputPeerToChatId)
+          .filter(Boolean),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+export async function addChatToFolder(
+  entry: LiveEntry,
+  folderId: number,
+  chatId: string,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Entity not found");
+
+  let inputPeer: any;
+  if (entity instanceof Api.User) {
+    inputPeer = new Api.InputPeerUser({
+      userId: (entity as any).id,
+      accessHash: (entity as any).accessHash ?? (BigInt(0) as any),
+    });
+  } else if (entity instanceof Api.Channel) {
+    inputPeer = new Api.InputPeerChannel({
+      channelId: (entity as any).id,
+      accessHash: (entity as any).accessHash ?? (BigInt(0) as any),
+    });
+  } else {
+    inputPeer = new Api.InputPeerChat({ chatId: (entity as any).id as any });
+  }
+
+  const raw = await entry.client.invoke(new Api.messages.GetDialogFilters());
+  const filters: any[] = Array.isArray(raw)
+    ? raw
+    : ((raw as any)?.filters ?? []);
+  const filter = filters.find((f: any) => f.id === folderId);
+  if (!filter) throw new Error("Folder not found");
+
+  // Avoid duplicates
+  const alreadyIncluded = ((filter.includePeers ?? []) as any[]).some(
+    (p: any) => inputPeerToChatId(p) === chatId,
+  );
+  if (!alreadyIncluded) {
+    filter.includePeers = [...(filter.includePeers ?? []), inputPeer];
+    // Remove from excludedPeers if present
+    filter.excludePeers = ((filter.excludePeers ?? []) as any[]).filter(
+      (p: any) => inputPeerToChatId(p) !== chatId,
+    );
+  }
+
+  await entry.client.invoke(
+    new Api.messages.UpdateDialogFilter({ id: folderId, filter }),
+  );
+}
+
+export type TgButtonResult = {
+  alert: boolean;
+  message: string | null;
+  url: string | null;
+};
+
+export type TgInvitePreview = {
+  hash: string;
+  title: string;
+  memberCount: number;
+  type: "group" | "channel";
+  alreadyJoined: boolean;
+  chatId?: string;
+};
+
+export type TgBotCommand = {
+  command: string;
+  description: string;
+};
+
+export async function clickButton(
+  entry: LiveEntry,
+  chatId: string,
+  msgId: number,
+  data: string,
+): Promise<TgButtonResult> {
+  const { client } = entry;
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  const dataBytes = Buffer.from(data, "base64");
+  if (process.env.DEBUG === '1') {
+    console.log(`[button] chatId=${chatId} msgId=${msgId} data_hex=${dataBytes.toString('hex')}`);
+  }
+  const result = await client.invoke(
+    new Api.messages.GetBotCallbackAnswer({
+      peer: entity as any,
+      msgId,
+      data: dataBytes,
+      game: false,
+    }),
+  );
+  if (process.env.DEBUG === '1') {
+    const safeUrl = result.url
+      ? result.url.replace(/([?&](?:token|hash|tgaddr)=)[^&]*/gi, '$1[REDACTED]')
+      : 'null';
+    console.log(`[button] alert=${result.alert} msg=${JSON.stringify(result.message)} url=${safeUrl}`);
+  }
+  return {
+    alert: result.alert ?? false,
+    message: result.message ?? null,
+    url: result.url ?? null,
+  };
+}
+
+export async function sendReaction(
+  entry: LiveEntry,
+  chatId: string,
+  msgId: number,
+  emoji: string | null,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  await entry.client.invoke(
+    new Api.messages.SendReaction({
+      peer: entity as any,
+      msgId,
+      reaction: emoji ? [new Api.ReactionEmoji({ emoticon: emoji })] : [],
+    }),
+  );
+}
+
+export async function getThreadMessages(
+  entry: LiveEntry,
+  chatId: string,
+  msgId: number,
+  limit: number,
+  offsetId: number,
+): Promise<TgMsgPayload[]> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+
+  const result = await entry.client.invoke(
+    new Api.messages.GetReplies({
+      peer: entity as any,
+      msgId,
+      offsetId,
+      offsetDate: 0,
+      addOffset: 0,
+      limit,
+      maxId: 0,
+      minId: 0,
+      hash: BigInt(0) as any,
+    }),
+  );
+
+  const msgs = ((result as any).messages ?? []) as Api.Message[];
+  const readMaxId = entry.readOutboxCache.get(chatId) ?? 0;
+  return msgs.map((msg) => {
+    let fromName: string | null = null;
+    if (msg.fromId) {
+      const fid = peerToChatId(msg.fromId as Api.TypePeer);
+      const sender = entry.entityCache.get(fid);
+      if (sender) fromName = entityName(sender);
+    }
+    return {
+      id: msg.id,
+      text: msg.message ?? "",
+      html: entitiesToHtml(msg.message ?? "", msg.entities),
+      date: msg.date,
+      fromMe: Boolean(msg.out),
+      isRead: Boolean(msg.out) && msg.id <= readMaxId,
+      fromId: msg.fromId ? peerToChatId(msg.fromId as Api.TypePeer) : null,
+      fromName,
+      hasPhoto: msg.media instanceof Api.MessageMediaPhoto,
+      hasDocument:
+        msg.media instanceof Api.MessageMediaDocument &&
+        !isStickerDoc(msg.media),
+      hasSticker: isStickerDoc(msg.media),
+      fileName: docFileName(msg.media),
+      buttons: extractButtons(msg),
+      reactions: extractReactions(msg),
+      replyToId: null,
+      replyToText: null,
+      replyToName: null,
+      replyCount: null,
+    };
+  });
+}
+
+/**
+ * What a bot offers beside the composer: its command list, and its menu button.
+ *
+ * The menu button is the Mini App a bot pins next to the input ("Misaya Media" and the
+ * like). It is a property of the bot rather than of any message, so it appears nowhere in
+ * the chat history -- without asking for it here there is nothing to render.
+ *
+ * Both come from the one GetFullUser call, since asking twice on every chat open is a
+ * round trip for nothing.
+ */
+export async function getBotInfo(
+  entry: LiveEntry,
+  chatId: string,
+): Promise<{ commands: TgBotCommand[]; menuButton: TgBotMenuButton | null }> {
+  const empty = { commands: [] as TgBotCommand[], menuButton: null };
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!(entity instanceof Api.User) || !entity.bot) return empty;
+  try {
+    const full = await entry.client.invoke(
+      new Api.users.GetFullUser({ id: entity as any }),
+    );
+    const info = (full as any).fullUser?.botInfo;
+    const commands: any[] = info?.commands ?? [];
+
+    // Three shapes come back here: the default and "commands" variants only say which
+    // menu the client should show, and carry no app. Only botMenuButton has one, which is
+    // the text and address of a Mini App.
+    const raw = info?.menuButton;
+    const menuButton: TgBotMenuButton | null =
+      raw && typeof raw.url === "string" && raw.url
+        ? { text: String(raw.text ?? "").trim() || "Mini App", url: raw.url }
+        : null;
+
+    return {
+      commands: commands.map((c: any) => ({
+        command: c.command as string,
+        description: c.description as string,
+      })),
+      menuButton,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+export async function resolvePeer(
+  entry: LiveEntry,
+  username: string,
+): Promise<TgDialogItem | null> {
+  const query = username.startsWith("@") ? username : `@${username}`;
+  try {
+    const entity = await entry.client.getEntity(query);
+    if (!entity) return null;
+    let chatId: string;
+    let type: TgDialogItem["type"];
+    let name: string;
+    let uname: string | null = null;
+    if (entity instanceof Api.User) {
+      chatId = `u${entity.id}`;
+      type = entity.bot ? "bot" : "user";
+      name =
+        [entity.firstName, entity.lastName].filter(Boolean).join(" ") || query;
+      uname = entity.username ?? null;
+    } else if (entity instanceof Api.Channel) {
+      chatId = `c${entity.id}`;
+      type = entity.megagroup ? "group" : "channel";
+      name = entity.title ?? query;
+      uname = entity.username ?? null;
+    } else if (entity instanceof Api.Chat) {
+      chatId = `g${(entity as Api.Chat).id}`;
+      type = "group";
+      name = (entity as Api.Chat).title ?? query;
+    } else {
+      return null;
+    }
+    entry.entityCache.set(chatId, entity as Api.User | Api.Chat | Api.Channel);
+    const left = entity instanceof Api.Channel ? Boolean(entity.left) : false;
+    return {
+      chatId,
+      name,
+      type,
+      username: uname,
+      unreadCount: 0,
+      lastMessage: null,
+      left,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export type JoinResult = { joined: true } | { requestSent: true };
+
+// Opens a bot chat and sends the startParam, mirroring a t.me/bot?start=PARAM deep link.
+// Tries messages.StartBot first (correct for first-time activation); falls back to sending
+// /start PARAM as a plain message when the bot is already active.
+export async function startBot(
+  entry: LiveEntry,
+  username: string,
+  startParam: string,
+): Promise<TgDialogItem> {
+  const query = username.startsWith("@") ? username : `@${username}`;
+  const entity = await entry.client.getEntity(query);
+  if (!(entity instanceof Api.User) || !entity.bot) {
+    throw new Error("Not a bot");
+  }
+  const chatId = `u${entity.id}`;
+  entry.entityCache.set(chatId, entity);
+
+  try {
+    await entry.client.invoke(
+      new Api.messages.StartBot({
+        bot: entity as any,
+        peer: entity as any,
+        randomId: BigInt(Date.now() % 1_000_000_000) as any,
+        startParam,
+      }),
+    );
+  } catch {
+    // Bot already started -- send the command as a regular message instead
+    await entry.client.sendMessage(entity, {
+      message: `/start ${startParam}`,
+      parseMode: false,
+    });
+  }
+
+  const name =
+    [entity.firstName, entity.lastName].filter(Boolean).join(" ") || username;
+  return {
+    chatId,
+    name,
+    type: "bot",
+    username: entity.username ?? null,
+    unreadCount: 0,
+    lastMessage: null,
+  };
+}
+
+// Mini app link parsing is shared with the job runner (tg/miniApp.ts); re-exported
+// here so existing callers keep working.
+export { parseMiniAppLink };
+
+// Resolves a mini app URL to an authenticated web app URL.
+// Handles two cases:
+//   - t.me/BotName?startapp=HASH            -- uses RequestMainWebView
+//   - t.me/BotName/AppShortName?startapp=HASH -- uses RequestAppWebView
+//   - Direct web app URL from a KeyboardButtonWebView -- uses RequestSimpleWebView
+export async function resolveWebApp(
+  entry: LiveEntry,
+  tmeOrUrl: string,
+  botChatId?: string, // for direct URLs we need to know which bot owns the app
+  peerChatId?: string, // chat where the webview button lives (for RequestWebView)
+  fromBotMenu?: boolean, // the address came from the bot's menu button, not a message
+): Promise<{ url: string; resolved: boolean }> {
+  const miniApp = parseMiniAppLink(tmeOrUrl);
+  if (miniApp) {
+    const { botUsername, appShortName, startParam } = miniApp;
+    const bot = (await entry.client.getEntity(botUsername)) as Api.User;
+    entry.entityCache.set(entityToChatId(bot), bot);
+
+    if (appShortName) {
+      // Named mini app: use RequestAppWebView with InputBotAppShortName
+      const inputUser = new Api.InputUser({
+        userId: bot.id,
+        accessHash: bot.accessHash!,
+      });
+      const result = (await entry.client.invoke(
+        new Api.messages.RequestAppWebView({
+          peer: bot,
+          app: new Api.InputBotAppShortName({
+            botId: inputUser,
+            shortName: appShortName,
+          }),
+          startParam,
+          platform: "web",
+          writeAllowed: true,
+        }),
+      )) as any;
+      return { url: withClientLaunchParams(result.url as string), resolved: true };
+    }
+
+    const result = (await entry.client.invoke(
+      new Api.messages.RequestMainWebView({
+        peer: bot,
+        bot,
+        platform: "web",
+        startParam,
+      }),
+    )) as any;
+    return { url: withClientLaunchParams(result.url as string), resolved: true };
+  }
+
+  // Direct web app URL with a known bot
+  if (botChatId) {
+    try {
+      await ensureEntityCached(entry, botChatId);
+      const bot = entry.entityCache.get(botChatId) as Api.User | undefined;
+      if (bot instanceof Api.User) {
+        // Inline webview buttons need RequestWebView; its URL carries the full
+        // signed init data (query_id included) that mini apps expect
+        let peer: any = bot;
+        if (peerChatId && peerChatId !== botChatId) {
+          await ensureEntityCached(entry, peerChatId);
+          peer = entry.entityCache.get(peerChatId) ?? bot;
+        }
+        try {
+          const result = (await entry.client.invoke(
+            new Api.messages.RequestWebView({
+              peer,
+              bot,
+              url: tmeOrUrl,
+              platform: "web",
+              // Telegram signs a menu button's app only when told that is where the
+              // address came from. Asked without it, the request is taken for an
+              // inline-keyboard webview and what comes back carries no account data at
+              // all, so the app loads and immediately fails on "No initData found".
+              ...(fromBotMenu ? { fromBotMenu: true } : {}),
+            } as any),
+          )) as any;
+          return { url: withClientLaunchParams(result.url as string), resolved: true };
+        } catch {
+          const result = (await entry.client.invoke(
+            new Api.messages.RequestSimpleWebView({
+              bot,
+              url: tmeOrUrl,
+              platform: "web",
+            } as any),
+          )) as any;
+          return { url: withClientLaunchParams(result.url as string), resolved: true };
+        }
+      }
+    } catch {
+      // Bot rejected the webview request; treat as unresolved
+    }
+  }
+
+  // Could not obtain an authenticated web app URL -- caller decides the fallback
+  return { url: tmeOrUrl, resolved: false };
+}
+
+// Re-fetches the channel from TG to get the latest membership state.
+export async function checkMembership(
+  entry: LiveEntry,
+  chatId: string,
+): Promise<boolean> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity || !(entity instanceof Api.Channel)) return false;
+  try {
+    const result = (await entry.client.invoke(
+      new Api.channels.GetChannels({ id: [entity as Api.Channel] }),
+    )) as Api.messages.Chats;
+    const fresh = result.chats?.[0] as Api.Channel | undefined;
+    if (fresh) {
+      entry.entityCache.set(chatId, fresh);
+      return !fresh.left;
+    }
+  } catch {}
+  return false;
+}
+
+// Matches t.me/+HASH and t.me/joinchat/HASH invite links
+const INVITE_HASH_RE = /t\.me\/(?:\+|joinchat\/)([A-Za-z0-9_-]{5,})/g;
+
+function extractInviteHashes(msgs: Api.TypeMessage[]): string[] {
+  const hashes: string[] = [];
+  const seen = new Set<string>();
+  for (const m of msgs) {
+    if (!(m instanceof Api.Message)) continue;
+    // Links can sit in plain text, behind text entities, or on inline buttons
+    const sources: string[] = [m.message ?? ""];
+    for (const ent of (m.entities ?? []) as any[]) {
+      if (typeof ent?.url === "string") sources.push(ent.url);
+    }
+    for (const row of ((m as any).replyMarkup?.rows ?? []) as any[]) {
+      for (const btn of (row?.buttons ?? []) as any[]) {
+        if (typeof btn?.url === "string") sources.push(btn.url);
+      }
+    }
+    for (const src of sources) {
+      for (const match of src.matchAll(INVITE_HASH_RE)) {
+        if (!seen.has(match[1])) {
+          seen.add(match[1]);
+          hashes.push(match[1]);
+        }
+      }
+    }
+  }
+  return hashes;
+}
+
+// True when a message visibly references the channel (forward header, reply,
+// or being its peer) -- the references InputChannelFromMessage accepts
+function referencesChannel(m: Api.Message, channelId: any): boolean {
+  const id = channelId.toString();
+  const refs = [
+    (m.peerId as any)?.channelId,
+    (m.fwdFrom?.fromId as any)?.channelId,
+    ((m.fwdFrom as any)?.savedFromPeer as any)?.channelId,
+    ((m.replyTo as any)?.replyToPeerId as any)?.channelId,
+  ];
+  return refs.some((r) => r != null && r.toString() === id);
+}
+
+// Private chats reject channels.JoinChannel on a min entity (as cached from
+// search results). Recover the way official clients can: derive a full channel
+// reference from a message that mentions it (no invite needed), or find invite
+// links in messages that mention the chat's title, verify each candidate
+// resolves to this chat, then join through the newest valid one.
+async function joinPrivateChannel(
+  entry: LiveEntry,
+  entity: Api.Channel,
+): Promise<JoinResult | null> {
+  const title = entityName(entity);
+  if (!title) return null;
+  const targetChatId = entityToChatId(entity);
+
+  let msgs: Api.TypeMessage[] = [];
+  try {
+    const result = await entry.client.invoke(
+      new Api.messages.SearchGlobal({
+        q: title,
+        filter: new Api.InputMessagesFilterEmpty(),
+        minDate: 0,
+        maxDate: 0,
+        offsetRate: 0,
+        offsetPeer: new Api.InputPeerEmpty(),
+        offsetId: 0,
+        limit: 50,
+      }),
+    );
+    msgs = ((result as any).messages ?? []) as Api.TypeMessage[];
+  } catch {
+    /* fall through with no messages */
+  }
+
+  // Strategy 1: join via a message reference -- works without any invite link
+  let fromMsgAttempts = 0;
+  for (const m of msgs) {
+    if (fromMsgAttempts >= 5) break;
+    if (!(m instanceof Api.Message) || !m.peerId) continue;
+    if (!referencesChannel(m, entity.id)) continue;
+    fromMsgAttempts++;
+    try {
+      const peer = await entry.client.getInputEntity(m.peerId);
+      await entry.client.invoke(
+        new Api.channels.JoinChannel({
+          channel: new Api.InputChannelFromMessage({
+            peer,
+            msgId: m.id,
+            channelId: entity.id,
+          }),
+        }),
+      );
+      (entity as any).left = false;
+      return { joined: true };
+    } catch (err: any) {
+      if (err?.message?.includes("INVITE_REQUEST_SENT")) {
+        return { requestSent: true };
+      }
+      if (err?.message?.includes("FLOOD")) throw err;
+      continue;
+    }
+  }
+
+  // Strategy 2: invite links found in the same messages
+  const hashes = extractInviteHashes(msgs);
+
+  // Cap the invite checks -- CheckChatInvite flood-limits aggressively
+  for (const hash of hashes.slice(0, 6)) {
+    let preview: TgInvitePreview;
+    try {
+      preview = await checkInvite(entry, hash);
+    } catch (err: any) {
+      if (err?.message?.includes("FLOOD")) throw err;
+      continue; // expired or revoked link
+    }
+
+    if (preview.alreadyJoined) {
+      if (preview.chatId === targetChatId) {
+        (entity as any).left = false;
+        return { joined: true };
+      }
+      continue;
+    }
+    // ChatInvite previews carry no chat id -- match on the exact title
+    if (preview.title !== title) continue;
+
+    try {
+      await joinInvite(entry, hash);
+      (entity as any).left = false;
+      return { joined: true };
+    } catch (err: any) {
+      if (err?.message?.includes("INVITE_REQUEST_SENT")) {
+        return { requestSent: true };
+      }
+      if (err?.message?.includes("USER_ALREADY_PARTICIPANT")) {
+        (entity as any).left = false;
+        return { joined: true };
+      }
+      if (err?.message?.includes("FLOOD")) throw err;
+      continue;
+    }
+  }
+  return null;
+}
+
+export async function joinChannel(
+  entry: LiveEntry,
+  chatId: string,
+): Promise<JoinResult> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  if (!(entity instanceof Api.Channel))
+    throw new Error("Only channels and supergroups can be joined this way");
+  try {
+    await entry.client.invoke(
+      new Api.channels.JoinChannel({ channel: entity }),
+    );
+    (entity as any).left = false;
+    return { joined: true };
+  } catch (err: any) {
+    // INVITE_REQUEST_SENT = group requires admin approval; request was submitted
+    if (err?.message?.includes("INVITE_REQUEST_SENT")) {
+      return { requestSent: true };
+    }
+    // Private chat -- recover via a message reference or a discovered invite
+    if (err?.message?.includes("CHANNEL_PRIVATE")) {
+      const recovered = await joinPrivateChannel(entry, entity);
+      if (recovered) return recovered;
+    }
+    throw err;
+  }
+}
+
+// Leave a group or channel. Branches on entity type: supergroups/channels use
+// channels.LeaveChannel; legacy basic groups use messages.DeleteChatUser.
+export async function leaveChat(
+  entry: LiveEntry,
+  chatId: string,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  if (entity instanceof Api.Channel) {
+    await entry.client.invoke(
+      new Api.channels.LeaveChannel({ channel: entity }),
+    );
+    (entity as any).left = true;
+  } else if (entity instanceof Api.Chat) {
+    await entry.client.invoke(
+      new Api.messages.DeleteChatUser({
+        chatId: (entity as any).id,
+        userId: new Api.InputUserSelf(),
+      }),
+    );
+  } else {
+    throw new Error("Only groups and channels can be left");
+  }
+}
+
+export async function markRead(
+  entry: LiveEntry,
+  chatId: string,
+  maxId: number,
+): Promise<void> {
+  await ensureEntityCached(entry, chatId);
+  const entity = entry.entityCache.get(chatId);
+  if (!entity) throw new Error("Chat not found");
+  if (chatId.startsWith("c")) {
+    await entry.client.invoke(
+      new Api.channels.ReadHistory({ channel: entity as any, maxId }),
+    );
+  } else {
+    await entry.client.invoke(
+      new Api.messages.ReadHistory({ peer: entity as any, maxId }),
+    );
+  }
+}
+
+export async function checkInvite(
+  entry: LiveEntry,
+  hash: string,
+): Promise<TgInvitePreview> {
+  const result = await entry.client.invoke(
+    new Api.messages.CheckChatInvite({ hash }),
+  );
+  if (
+    result instanceof Api.ChatInviteAlready ||
+    result instanceof Api.ChatInvitePeek
+  ) {
+    const chat = result.chat as Api.Chat | Api.Channel;
+    let chatId = "";
+    let title = "";
+    let memberCount = 0;
+    let type: "group" | "channel" = "group";
+    if (chat instanceof Api.Channel) {
+      chatId = `c${chat.id}`;
+      title = chat.title ?? "";
+      memberCount = (chat as any).participantsCount ?? 0;
+      type = chat.megagroup ? "group" : "channel";
+      entry.entityCache.set(chatId, chat);
+    } else if (chat instanceof Api.Chat) {
+      chatId = `g${chat.id}`;
+      title = chat.title ?? "";
+      memberCount = (chat as any).participantsCount ?? 0;
+      entry.entityCache.set(chatId, chat);
+    }
+    return {
+      hash,
+      title,
+      memberCount,
+      type,
+      alreadyJoined: true,
+      chatId: chatId || undefined,
+    };
+  }
+  const invite = result as Api.ChatInvite;
+  const type: "group" | "channel" =
+    (invite as any).channel && !(invite as any).megagroup ? "channel" : "group";
+  return {
+    hash,
+    title: (invite as any).title ?? "",
+    memberCount: (invite as any).participantsCount ?? 0,
+    type,
+    alreadyJoined: false,
+  };
+}
+
+export async function joinInvite(
+  entry: LiveEntry,
+  hash: string,
+): Promise<TgDialogItem> {
+  const updates = await entry.client.invoke(
+    new Api.messages.ImportChatInvite({ hash }),
+  );
+  const chats = (updates as any).chats as (Api.Chat | Api.Channel)[];
+  const chat = chats?.[0];
+  if (!chat) throw new Error("Failed to join: no chat in response");
+  let chatId: string;
+  let name: string;
+  let type: TgDialogItem["type"];
+  let username: string | null = null;
+  if (chat instanceof Api.Channel) {
+    chatId = `c${chat.id}`;
+    name = chat.title ?? "";
+    type = chat.megagroup ? "group" : "channel";
+    username = chat.username ?? null;
+    entry.entityCache.set(chatId, chat);
+  } else {
+    chatId = `g${(chat as Api.Chat).id}`;
+    name = (chat as Api.Chat).title ?? "";
+    type = "group";
+    entry.entityCache.set(chatId, chat as Api.Chat);
+  }
+  return { chatId, name, type, username, unreadCount: 0, lastMessage: null };
+}
+
+export function getReadOutboxMaxId(accountId: number, chatId: string): number {
+  return liveClients.get(accountId)?.readOutboxCache.get(chatId) ?? 0;
+}
+
+export function subscribeToReadOutbox(
+  accountId: number,
+  handler: (chatId: string, maxId: number) => void,
+): () => void {
+  const entry = liveClients.get(accountId);
+  if (!entry) return () => {};
+  entry.readSubscribers.add(handler);
+  return () => entry.readSubscribers.delete(handler);
+}
+
+export function subscribeToMessages(
+  accountId: number,
+  handler: (msg: TgLiveMessage) => void,
+): () => void {
+  const entry = liveClients.get(accountId);
+  if (!entry) return () => {};
+  entry.subscribers.add(handler);
+  return () => entry.subscribers.delete(handler);
+}
+
+export function subscribeToDialogs(
+  accountId: number,
+  handler: (dialogs: TgDialogItem[]) => void,
+): () => void {
+  const entry = liveClients.get(accountId);
+  if (!entry) return () => {};
+  entry.dialogSubscribers.add(handler);
+  return () => entry.dialogSubscribers.delete(handler);
+}
+
+export function subscribeToTyping(
+  accountId: number,
+  handler: (event: TgTypingEvent) => void,
+): () => void {
+  const entry = liveClients.get(accountId);
+  if (!entry) return () => {};
+  entry.typingSubscribers.add(handler);
+  return () => entry.typingSubscribers.delete(handler);
+}
+
+// --- Message cache helpers ---
+
+// The repository layer speaks in payload strings; these wrappers keep the ChatCache-facing
+// signatures exactly as they were, so only `await` changes for callers.
+//
+// The two `db.transaction()` blocks that wrapped the former bulk inserts become sequential
+// awaits inside db/repos/cache.ts (a bulkWrite). A MongoDB transaction would need a replica
+// set, so it is not used here -- these writes were never load-bearing as one unit: they are
+// idempotent upserts of a re-derivable cache, so a partial write costs at most a refetch
+// from Telegram rather than leaving the cache wrong. The per-chat trim to MSG_CACHE_MAX now
+// lives in the repository's trimCache.
+
+export async function getCachedMessages(
+  accountId: number,
+  chatId: string,
+  limit: number,
+  beforeId?: number,
+): Promise<TgMsgPayload[]> {
+  const payloads = await readCachedMessages(accountId, chatId, limit, beforeId);
+  return payloads.map((p) => JSON.parse(p) as TgMsgPayload);
+}
+
+export async function cacheMessages(
+  accountId: number,
+  chatId: string,
+  msgs: TgMsgPayload[],
+): Promise<void> {
+  if (!msgs.length) return;
+  await writeCachedMessages(accountId, chatId, msgs, (msg: TgMsgPayload) =>
+    JSON.stringify(msg),
+  );
+}
+
+// Rewrite the cached payload text after an edit so reloads show the new text
+export async function updateCachedMessageText(
+  accountId: number,
+  chatId: string,
+  msgId: number,
+  text: string,
+): Promise<void> {
+  // The cache row's key is the composite id; the payload has to be read back before the
+  // edit can be merged into it, which the repository deliberately leaves to its callers.
+  const row = await col<MessageCacheDoc>("tg_message_cache").findOne(
+    { _id: `${accountId}:${chatId}:${msgId}` },
+    { projection: { payload: 1 } },
+  );
+  if (!row) return;
+  const payload = JSON.parse(row.payload) as TgMsgPayload;
+  payload.text = text;
+  payload.html = entitiesToHtml(text, undefined);
+  await writeCachedMessagePayload(
+    accountId,
+    chatId,
+    msgId,
+    JSON.stringify(payload),
+  );
+}
+
+export async function removeCachedMessages(
+  accountId: number,
+  chatId: string,
+  ids: number[],
+): Promise<void> {
+  if (!ids.length) return;
+  await deleteCachedMessages(accountId, chatId, ids);
+}
+
+export async function clearCachedMessages(
+  accountId: number,
+  chatId: string,
+): Promise<void> {
+  await dropCachedMessages(accountId, chatId);
+}
+
+// Fetches messages newer than the last cached msg and pushes them to subscribers.
+// Pass afterId to override the cache-based baseline (used by WS periodic sync).
+export async function syncMessagesInBackground(
+  accountId: number,
+  chatId: string,
+  afterId?: number,
+): Promise<void> {
+  const entry = liveClients.get(accountId);
+  if (!entry) return;
+
+  let maxId = afterId ?? 0;
+  if (!maxId) {
+    // SELECT MAX(msg_id) FROM tg_message_cache WHERE account_id = ? AND chat_id = ?
+    maxId = await readMaxCachedMessageId(accountId, chatId);
+  }
+  if (!maxId) return;
+
+  const recent = await getMessages(entry, chatId, 100, 0);
+  const newMsgs = recent.filter((m) => m.id > maxId);
+  if (!newMsgs.length) return;
+  await cacheMessages(accountId, chatId, newMsgs);
+  // Push oldest-first so the frontend appends in chronological order
+  const ordered = newMsgs.slice().sort((a, b) => a.id - b.id);
+  for (const msg of ordered) {
+    entry.subscribers.forEach((sub) => sub({ chatId, message: msg }));
+  }
+}
+
+// --- Dialog cache helpers ---
+
+export async function getCachedDialogs(
+  accountId: number,
+): Promise<TgDialogItem[]> {
+  const payloads = await readCachedDialogs(accountId);
+  return payloads.map((p) => JSON.parse(p) as TgDialogItem);
+}
+
+export async function cacheDialogs(
+  accountId: number,
+  dialogs: TgDialogItem[],
+): Promise<void> {
+  if (!dialogs.length) return;
+  await writeCachedDialogs(accountId, dialogs, (dialog: TgDialogItem) =>
+    JSON.stringify(dialog),
+  );
+}
+
+// Drop everything cached for an account: the message/dialog caches and the
+// live client's in-memory entity, avatar and read-state caches. All of it is
+// refetched from Telegram on demand.
+export async function clearAccountCache(accountId: number): Promise<void> {
+  await dropAccountCache(accountId);
+  const entry = liveClients.get(accountId);
+  if (entry) {
+    entry.entityCache.clear();
+    entry.avatarCache.clear();
+    entry.readOutboxCache.clear();
+  }
+}
+
+export async function removeCachedDialog(
+  accountId: number,
+  chatId: string,
+): Promise<void> {
+  await deleteCachedDialog(accountId, chatId);
+}
+
+// Removes cached rows for chats no longer in a full dialog load
+// (deleted chats, left groups). Upserts alone never drop them.
+async function pruneCachedDialogs(
+  accountId: number,
+  dialogs: TgDialogItem[],
+): Promise<void> {
+  if (!dialogs.length) return;
+  const keep = dialogs.map((d) => d.chatId);
+  await dropStaleCachedDialogs(accountId, keep);
+}
+
+export async function syncDialogsInBackground(
+  accountId: number,
+): Promise<void> {
+  const entry = liveClients.get(accountId);
+  if (!entry) return;
+  try {
+    const dialogs = await loadDialogs(entry);
+    await pruneCachedDialogs(accountId, dialogs);
+    await cacheDialogs(accountId, dialogs);
+    entry.dialogSubscribers.forEach((sub) => sub(dialogs));
+  } catch {}
+}
+
+export type TgCleanResult = {
+  left: number;
+  deleted: number;
+  contacts: number;
+  folders: number;
+  failed: { chatId: string; name: string; error: string }[];
+};
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Bulk-clean an account: leave every group and channel, delete every private
+// chat for both sides, remove all contacts and all custom chat folders.
+// Saved Messages is kept. Destructive and irreversible -- the caller is
+// responsible for confirming with the user first.
+// Dialog loads are capped, so process in rounds until nothing is pending.
+export async function cleanAccount(
+  entry: LiveEntry,
+  accountId: number,
+): Promise<TgCleanResult> {
+  const result: TgCleanResult = {
+    left: 0,
+    deleted: 0,
+    contacts: 0,
+    folders: 0,
+    failed: [],
+  };
+  const failedIds = new Set<string>();
+
+  for (let round = 0; round < 10; round++) {
+    const dialogs = await loadDialogs(entry);
+    const pending = dialogs.filter((d) => {
+      if (failedIds.has(d.chatId)) return false;
+      const entity = entry.entityCache.get(d.chatId);
+      if (entity instanceof Api.User) {
+        // Never wipe the user's own Saved Messages
+        if (entity.self) return false;
+        // Keep Telegram service notifications (u777000) and SpamBot --
+        // both are needed for account status and appeal messages
+        if (entity.id.toString() === "777000") return false;
+        if ((entity.username ?? "").toLowerCase() === "spambot") return false;
+      }
+      return true;
+    });
+    if (!pending.length) break;
+
+    for (const d of pending) {
+      try {
+        if (d.type === "group" || d.type === "channel") {
+          await leaveChat(entry, d.chatId);
+          // Leaving does not always drop the dialog -- clear the leftover copy
+          try {
+            await deleteHistory(entry, d.chatId, false);
+          } catch {}
+          result.left++;
+        } else {
+          await deleteHistory(entry, d.chatId, true);
+          result.deleted++;
+        }
+        await removeCachedDialog(accountId, d.chatId);
+        await clearCachedMessages(accountId, d.chatId);
+        // Pace the calls to stay clear of Telegram flood limits
+        await sleep(250);
+      } catch (err: any) {
+        failedIds.add(d.chatId);
+        result.failed.push({
+          chatId: d.chatId,
+          name: d.name,
+          error: err?.message ?? String(err),
+        });
+      }
+    }
+  }
+
+  // Remove all custom chat folders (the default "All chats" view has no id).
+  // UpdateDialogFilter without a filter payload deletes the folder.
+  try {
+    const raw = await entry.client.invoke(new Api.messages.GetDialogFilters());
+    const filters: any[] = Array.isArray(raw)
+      ? raw
+      : ((raw as any)?.filters ?? []);
+    for (const f of filters) {
+      if (!f.id) continue;
+      await entry.client.invoke(
+        new Api.messages.UpdateDialogFilter({ id: f.id }),
+      );
+      result.folders++;
+      await sleep(250);
+    }
+  } catch (err: any) {
+    result.failed.push({
+      chatId: "folders",
+      name: "Folders",
+      error: err?.message ?? String(err),
+    });
+  }
+
+  // Remove all contacts, deleted accounts included
+  try {
+    const res = await entry.client.invoke(
+      new Api.contacts.GetContacts({ hash: BigInt(0) as any }),
+    );
+    if ("users" in res) {
+      const ids = (res.users as Api.User[]).map(
+        (u) =>
+          new Api.InputUser({
+            userId: u.id,
+            accessHash: u.accessHash ?? (BigInt(0) as any),
+          }),
+      );
+      for (let i = 0; i < ids.length; i += 100) {
+        const batch = ids.slice(i, i + 100);
+        await entry.client.invoke(
+          new Api.contacts.DeleteContacts({ id: batch }),
+        );
+        result.contacts += batch.length;
+        await sleep(250);
+      }
+    }
+  } catch (err: any) {
+    result.failed.push({
+      chatId: "contacts",
+      name: "Contacts",
+      error: err?.message ?? String(err),
+    });
+  }
+
+  return result;
+}

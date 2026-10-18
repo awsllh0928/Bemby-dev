@@ -1,0 +1,33 @@
+services:
+  # The database Bemby stores everything in. A single container is all it needs -- note
+  # that MongoDB transactions require a replica set, so multi-document atomicity is not
+  # available here; the code is written to tolerate that.
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - /docker/bemby-mongo:/data/db
+    # Not published: only Bemby should be able to reach it.
+    command: ["--bind_ip_all"]
+
+  bemby:
+    image: liveinaus/bemby:latest
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    ports:
+      - "3000:3000"
+    volumes:
+      - /docker/bemby-data:/app/data
+    environment:
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}    # change this
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme} # change this
+      # Set on first boot so Bemby comes up connected. Afterwards the panel's own
+      # connection (written to /app/data/database.json) takes precedence.
+      MONGODB_URI: mongodb://mongo:27017
+      MONGODB_DB: bemby
+      # Secret used to sign login tokens. Required: set to a long random string,
+      # e.g. `openssl rand -hex 32`. Compose refuses to start if it is unset.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET to a long random string, e.g. openssl rand -hex 32}
+      # Optional: set a timezone, e.g. TZ=Australia/Sydney (defaults to UTC)
+      # TZ: ${TZ:-UTC}
