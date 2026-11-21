@@ -49,11 +49,7 @@ api.interceptors.request.use((config) => {
 function isCredentialCheck(url: string | undefined): boolean {
   if (!url) return false;
   const path = url.split("?")[0];
-  return (
-    path.endsWith("/auth/login") ||
-    path.endsWith("/auth/captcha") ||
-    path.endsWith("/auth/credentials")
-  );
+  return path.endsWith("/auth/login") || path.endsWith("/auth/credentials");
 }
 
 // Redirect to login on 401; surface force-password-change on 403
@@ -711,21 +707,12 @@ export type ScheduleStatus = {
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 export const authApi = {
-  getCaptcha: () =>
-    api
-      .get<{ svg: string; captchaToken: string }>("/auth/captcha")
-      .then((r) => r.data),
-  login: (
-    username: string,
-    password: string,
-    captchaToken: string,
-    captchaAnswer: string,
-  ) =>
+  login: (username: string, password: string) =>
     api
       .post<{
         token: string;
         requirePasswordChange?: boolean;
-      }>("/auth/login", { username, password, captchaToken, captchaAnswer })
+      }>("/auth/login", { username, password })
       .then((r) => r.data),
   changeCredentials: (
     currentPassword: string,

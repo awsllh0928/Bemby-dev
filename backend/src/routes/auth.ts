@@ -1,10 +1,8 @@
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
-import svgCaptcha from 'svg-captcha';
 import { setSetting } from '../db/repos/settings';
 import { bumpTokenEpoch, getJwtSecret, requireAuth, sessionClaims } from '../middleware/auth';
-import { consumeCaptcha, issueCaptcha } from '../auth/captchaStore';
 import {
   legacyHashPassword,
   hashPassword,
@@ -15,23 +13,15 @@ import {
   getStoredCredentials as getStoredCreds,
 } from '../auth/credentials';
 
+// The sign-in form asks for a username and a password and nothing else. The per-IP limiter
+// below stays as the only brake on guessing, so it is the thing to watch if the form ever
+// starts refusing people who are typing their real password.
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { error: 'Too many login attempts. Please try again later.' },
-});
-
-// Handing out challenges is cheap but not free, and an unbounded stream of them is the one
-// way to make the store churn. Generous enough that a person reloading a stuck captcha
-// never meets it.
-const captchaLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 60,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: { error: 'Too many captcha requests. Please try again later.' },
 });
 
 // Both of these check the current password, so they are password guessing by another name
@@ -52,35 +42,14 @@ const ADMIN_PASSWORD_HASH_FALLBACK: string | null = (() => {
   return p ? legacyHashPassword(p) : null;
 })();
 
-router.get('/captcha', captchaLimiter, (_req, res) => {
-  const captcha = svgCaptcha.create({ noise: 2, color: true, size: 5, ignoreChars: '0oO1lI' });
-  // The answer stays in the process (see auth/captchaStore); what goes out is an opaque id.
-  // The field keeps its old name so an already-loaded page keeps working.
-  res.json({ svg: captcha.data, captchaToken: issueCaptcha(captcha.text) });
-});
-
 router.post('/login', loginLimiter, async (req, res) => {
-  const { username, password, captchaToken, captchaAnswer } = req.body as {
+  const { username, password } = req.body as {
     username?: string;
     password?: string;
-    captchaToken?: string;
-    captchaAnswer?: string;
   };
 
   if (!username || !password) {
     res.status(400).json({ error: 'Username and password are required' });
-    return;
-  }
-
-  if (!captchaToken || !captchaAnswer) {
-    res.status(400).json({ error: 'Captcha is required' });
-    return;
-  }
-
-  // One challenge, one attempt: consuming it here means a solved captcha cannot be replayed
-  // across a run of password guesses.
-  if (!consumeCaptcha(captchaToken, captchaAnswer)) {
-    res.status(400).json({ error: 'Incorrect or expired captcha, please refresh' });
     return;
   }
 
